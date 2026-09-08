@@ -1,0 +1,18 @@
+[
+  { "id": "F1", "org": "orgA", "source": 0, "ci": 1, "state": 0,
+    "changes": [
+      { "file": "src/auth/login.go", "type": "modified", "additions": 10, "deletions": 5,
+        "content": "@@ -1,5 +1,10 @@\n-old\n+new\n@@ -40,2 +45,2 @@\n-a\n+b" },
+      { "file": "src/auth/login_test.go", "type": "added", "additions": 4, "deletions": 0,
+        "content": "@@ -0,0 +1,4 @@\n+a\n+b\n+c\n+d" },
+      { "file": "docs/auth.md", "type": "renamed", "previous_file": "README-auth.md", "additions": 1, "deletions": 1,
+        "content": "@@ -1 +1 @@\n-x\n+y" },
+      { "file": "deploy/values.yaml", "type": "removed", "additions": 0, "deletions": 30,
+        "content": "@@ -1,30 +0,0 @@\n-gone" }
+    ] },
+  { "id": "F2", "org": "orgA", "source": 0, "ci": 1, "state": 0,
+    "changes": [
+      { "file": "src/util/format.go", "content": "a\nb\nc" }
+    ] },
+  { "id": "F3", "org": "orgA", "source": 0, "ci": 1, "state": 0 }
+]

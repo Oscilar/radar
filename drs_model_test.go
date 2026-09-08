@@ -327,3 +327,24 @@ func TestScorerNames(t *testing.T) {
 		t.Fatal("DRSModelScorer.Name mismatch")
 	}
 }
+
+func TestDRSModelFeatureValuesCoversRegistry(t *testing.T) {
+	d := Diff{Changes: []Change{{File: "src/auth/login_test.go", Type: "added", Additions: 4, Content: "@@ -0,0 +1,4 @@\n+a"}}}
+	values := DRSModelFeatureValues(d)
+	names := DRSModelFeatureNames()
+	if len(values) != len(names) {
+		t.Fatalf("%d values for %d features", len(values), len(names))
+	}
+	for _, name := range names {
+		got, ok := values[name]
+		if !ok {
+			t.Fatalf("missing %q", name)
+		}
+		if want := drsModelFeatures[name](d); got != want {
+			t.Errorf("%s = %v, want %v", name, got, want)
+		}
+	}
+	if values["risky_path_files"] != 1 || values["test_files"] != 1 || values["hunk_count"] != 1 || values["lines_changed"] != 4 {
+		t.Fatalf("values = %v", values)
+	}
+}

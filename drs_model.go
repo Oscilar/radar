@@ -118,6 +118,18 @@ func DRSModelFeatureNames() []string {
 	return names
 }
 
+// DRSModelFeatureValues computes every registered feature for the diff, keyed
+// by name. It is the golden for a reimplementation of the feature rules: a
+// training pipeline that reproduces these values feeds the model exactly what
+// DRSModelScorer.Score does.
+func DRSModelFeatureValues(d Diff) map[string]float64 {
+	values := make(map[string]float64, len(drsModelFeatures))
+	for name, feature := range drsModelFeatures {
+		values[name] = feature(d)
+	}
+	return values
+}
+
 func sumChanges(d Diff, f func(Change) int) int {
 	total := 0
 	for _, c := range d.Changes {

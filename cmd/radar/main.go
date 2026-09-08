@@ -2,13 +2,15 @@
 //
 // Usage:
 //
-//	radar classify  [-llm] [-scorer NAME] [-calibration sample.json] <diff.json>
-//	radar replay    [-llm] [-scorer NAME] <diffs.json>
-//	radar calibrate [-scorer NAME] [-points N] <diffs.json>
+//	radar classify     [-llm] [-scorer NAME] [-calibration sample.json] <diff.json>
+//	radar replay       [-llm] [-scorer NAME] <diffs.json>
+//	radar calibrate    [-scorer NAME] [-points N] <diffs.json>
+//	radar drs-features [-names] <diffs.json>
 //
 // classify prints one diff's decision and trace; replay classifies a batch and
 // prints RADAR RQ metrics; calibrate scores a batch and prints a quantile
-// sample suitable for a policy's calibration_sample.
+// sample suitable for a policy's calibration_sample; drs-features prints every
+// DRS model feature value per diff, as a golden for reimplementations.
 //
 // With -llm the Automated Code Review stage uses the Anthropic API (requires
 // $ANTHROPIC_API_KEY); otherwise the deterministic rule-based ACR is used.
@@ -40,6 +42,8 @@ func main() {
 		os.Exit(runReplay(os.Args[2:]))
 	case "calibrate":
 		os.Exit(runCalibrate(os.Args[2:]))
+	case "drs-features":
+		os.Exit(runDRSFeatures(os.Args[2:]))
 	case "-h", "--help", "help":
 		usage()
 		os.Exit(0)
@@ -54,9 +58,10 @@ func usage() {
 	fmt.Fprint(os.Stderr, `radar — Risk Aware Diff Auto Review (arXiv:2605.30208)
 
 Usage:
-  radar classify  [-llm] [-json] [-scorer NAME] [-calibration sample.json] <diff.json>
-  radar replay    [-llm] [-scorer NAME] <diffs.json>
-  radar calibrate [-scorer NAME] [-points N] <diffs.json>
+  radar classify     [-llm] [-json] [-scorer NAME] [-calibration sample.json] <diff.json>
+  radar replay       [-llm] [-scorer NAME] <diffs.json>
+  radar calibrate    [-scorer NAME] [-points N] <diffs.json>
+  radar drs-features [-names] <diffs.json>
 
 Flags:
   -llm          use the Anthropic-backed ACR agent (needs $ANTHROPIC_API_KEY)
@@ -65,6 +70,7 @@ Flags:
   -calibration  (classify) JSON array of raw scores to calibrate against, as
                 printed by calibrate; required with -scorer drs-model
   -points       (calibrate) number of quantile points to print (default 41)
+  -names        (drs-features) print only the sorted feature names
 `)
 }
 
@@ -232,6 +238,57 @@ func runCalibrate(args []string) int {
 	enc := json.NewEncoder(os.Stdout)
 	if err := enc.Encode(sample); err != nil {
 		fmt.Fprintln(os.Stderr, "calibrate:", err)
+		return 1
+	}
+	return 0
+}
+
+// drsFeatureRow is one drs-features output record: a diff's id and every
+// registered DRS model feature (encoding/json sorts the map keys).
+type drsFeatureRow struct {
+	ID       string             `json:"id"`
+	Features map[string]float64 `json:"features"`
+}
+
+func drsFeatureRows(diffs []radar.Diff) []drsFeatureRow {
+	rows := make([]drsFeatureRow, len(diffs))
+	for i, d := range diffs {
+		rows[i] = drsFeatureRow{ID: d.ID, Features: radar.DRSModelFeatureValues(d)}
+	}
+	return rows
+}
+
+// runDRSFeatures prints every DRS model feature value for every diff in the
+// input (or, with -names, just the sorted feature names) as JSON on stdout. A
+// reimplementation of the feature rules can diff its output against this.
+func runDRSFeatures(args []string) int {
+	fs := flag.NewFlagSet("drs-features", flag.ExitOnError)
+	namesOnly := fs.Bool("names", false, "print only the sorted feature names")
+	_ = fs.Parse(args)
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if *namesOnly {
+		if fs.NArg() != 0 {
+			fmt.Fprintln(os.Stderr, "drs-features: -names takes no <diffs.json> argument")
+			return 2
+		}
+		if err := enc.Encode(radar.DRSModelFeatureNames()); err != nil {
+			fmt.Fprintln(os.Stderr, "drs-features:", err)
+			return 1
+		}
+		return 0
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(os.Stderr, "drs-features: expected exactly one <diffs.json> argument")
+		return 2
+	}
+	diffs, err := loadDiffs(fs.Arg(0))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "drs-features:", err)
+		return 1
+	}
+	if err := enc.Encode(drsFeatureRows(diffs)); err != nil {
+		fmt.Fprintln(os.Stderr, "drs-features:", err)
 		return 1
 	}
 	return 0

@@ -1,11 +1,14 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/travisjeffery/radar"
 )
 
 func TestQuantileSample(t *testing.T) {
@@ -95,5 +98,110 @@ func TestClassifyModelScorerRequiresCalibration(t *testing.T) {
 	data, _ := os.ReadFile(path)
 	if code != 2 || !strings.Contains(string(data), "requires -calibration") {
 		t.Fatalf("code=%d stderr=%q", code, data)
+	}
+}
+
+// captureStdout runs f with os.Stdout redirected to a file and returns what
+// was written.
+func captureStdout(t *testing.T, f func()) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "stdout")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdout
+	os.Stdout = file
+	defer func() { os.Stdout = old }()
+	f()
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+// TestDRSFeatureRows pins exact values for the fixture so a reimplementation
+// diffing against `radar drs-features testdata/drs_features.json` has a
+// known-good reference.
+func TestDRSFeatureRows(t *testing.T) {
+	diffs, err := loadDiffs(filepath.Join("..", "..", "testdata", "drs_features.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := drsFeatureRows(diffs)
+	if len(rows) != 3 {
+		t.Fatalf("rows = %d, want 3", len(rows))
+	}
+	want := map[string]map[string]float64{
+		// F1: 4 files; lines 15+4+2+30 = 51; two "auth" paths plus docs/auth.md = 3;
+		// one test file; docs/auth.md is a doc; values.yaml is config; 5 hunks.
+		"F1": {
+			"file_count": 4, "additions": 15, "deletions": 36, "lines_changed": 51, "max_file_lines": 30,
+			"risky_path_files": 3, "added_files": 1, "removed_files": 1, "modified_files": 1, "renamed_files": 1,
+			"test_files": 1, "doc_files": 1, "config_files": 1, "hunk_count": 5,
+		},
+		// F2: no provider counts, so lines fall back to newlines+1 of content.
+		"F2": {
+			"file_count": 1, "additions": 0, "deletions": 0, "lines_changed": 3, "max_file_lines": 3,
+			"risky_path_files": 0, "added_files": 0, "removed_files": 0, "modified_files": 0, "renamed_files": 0,
+			"test_files": 0, "doc_files": 0, "config_files": 0, "hunk_count": 0,
+		},
+	}
+	names := radar.DRSModelFeatureNames()
+	for _, row := range rows {
+		if len(row.Features) != len(names) {
+			t.Fatalf("%s: %d features, want %d", row.ID, len(row.Features), len(names))
+		}
+		for _, name := range names {
+			if _, ok := row.Features[name]; !ok {
+				t.Fatalf("%s: missing feature %q", row.ID, name)
+			}
+		}
+		expected, ok := want[row.ID]
+		if !ok {
+			continue
+		}
+		for name, value := range expected {
+			if got := row.Features[name]; got != value {
+				t.Errorf("%s %s = %v, want %v", row.ID, name, got, value)
+			}
+		}
+	}
+	// F3 has no changes at all: every feature is zero.
+	for name, value := range rows[2].Features {
+		if value != 0 {
+			t.Errorf("F3 %s = %v, want 0", name, value)
+		}
+	}
+}
+
+func TestRunDRSFeatures(t *testing.T) {
+	var code int
+	out := captureStdout(t, func() { code = runDRSFeatures([]string{"-names"}) })
+	var names []string
+	if err := json.Unmarshal([]byte(out), &names); err != nil || code != 0 {
+		t.Fatalf("code=%d out=%q err=%v", code, out, err)
+	}
+	if !reflect.DeepEqual(names, radar.DRSModelFeatureNames()) {
+		t.Fatalf("names = %v", names)
+	}
+
+	out = captureStdout(t, func() {
+		code = runDRSFeatures([]string{filepath.Join("..", "..", "testdata", "drs_features.json")})
+	})
+	var rows []drsFeatureRow
+	if err := json.Unmarshal([]byte(out), &rows); err != nil || code != 0 {
+		t.Fatalf("code=%d out=%q err=%v", code, out, err)
+	}
+	if len(rows) != 3 || rows[0].ID != "F1" || rows[0].Features["lines_changed"] != 51 || rows[1].Features["max_file_lines"] != 3 {
+		t.Fatalf("rows = %+v", rows)
+	}
+	// Keys are emitted sorted, so the golden is byte-stable across runs.
+	if !strings.Contains(out, "\"added_files\": 1,\n      \"additions\": 15,") {
+		t.Fatalf("features must be emitted in sorted order: %q", out)
 	}
 }

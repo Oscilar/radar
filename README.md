@@ -129,9 +129,10 @@ If you installed the release binaries, invoke `radar` and `radar-gh` directly.
 From a source checkout, use `go run ./cmd/radar` in place of `radar`.
 
 ```sh
-radar classify  [-llm] [-json] [-scorer NAME] [-calibration sample.json] testdata/human_approved.json
-radar replay    [-llm] [-scorer NAME]  testdata/diffs.json
-radar calibrate [-scorer NAME] [-points 41] testdata/diffs.json
+radar classify     [-llm] [-json] [-scorer NAME] [-calibration sample.json] testdata/human_approved.json
+radar replay       [-llm] [-scorer NAME]  testdata/diffs.json
+radar calibrate    [-scorer NAME] [-points 41] testdata/diffs.json
+radar drs-features [-names] testdata/drs_features.json
 ```
 
 `classify` prints the decision and the stage-by-stage trace for one diff.
@@ -155,6 +156,13 @@ at index `round(k*(n-1)/(N-1))`, rounding half away from zero (Go's
 `math.Round`; a Python port must not use the built-in round-half-to-even
 `round()`). The first and last points are therefore the min and max. Set the
 policy's `calibrated_for` to the same scorer name.
+
+`drs-features` reads the same diffs JSON and prints, for every diff, all DRS
+model feature values as
+`[{"id": "...", "features": {"added_files": 0, "additions": 15, ...}}, ...]`
+with the features sorted by name; `radar drs-features -names` prints just the
+sorted feature-name array. A reimplementation of the feature rules (such as
+the training pipeline) can diff its output against this as a golden.
 
 See `testdata/` for fixtures exercising every decision path.
 
@@ -268,7 +276,8 @@ The split of responsibilities is deliberate: the training pipeline (a
 separate Python package) decides *which* features to use, in what order, and
 with what weights; this package is the source of truth for *how* each named
 feature is computed from a `Diff`. The registry (`radar.DRSModelFeatureNames()`,
-pinned by `TestDRSModelFeatureNames`) is:
+pinned by `TestDRSModelFeatureNames`; values for a diff via
+`radar.DRSModelFeatureValues` or `radar drs-features`) is:
 
 | feature | rule |
 | --- | --- |
@@ -286,7 +295,9 @@ pinned by `TestDRSModelFeatureNames`) is:
 Every feature is derived from the fields the production adapter populates on
 each change — path, previous path, change type, additions, deletions, and the
 unified patch. `Complexity` and `Signals` are never set on that path, so no
-feature uses them.
+feature uses them. `testdata/drs_features.json` with
+`radar drs-features testdata/drs_features.json` is the reference output a
+reimplementation should reproduce exactly (`TestDRSFeatureRows` pins it).
 
 Loading fails closed. `NewDRSModelScorer` returns an error (and `-scorer
 drs-model` exits non-zero) for an unknown feature or transform, a duplicate
