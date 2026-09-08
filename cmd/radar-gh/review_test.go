@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -103,5 +105,131 @@ func TestValidateApprovalSnapshot(t *testing.T) {
 	changed.StaleApprovalsDismissed = false
 	if err := validateApprovalSnapshot(base, changed, head); err == nil {
 		t.Fatal("stale approval protection must block approval")
+	}
+}
+
+func TestCheckScorerCalibration(t *testing.T) {
+	tests := []struct {
+		calibratedFor string
+		scorer        string
+		wantErr       bool
+	}{
+		{"", radar.ScorerHeuristic, false},
+		{radar.ScorerHeuristic, radar.ScorerHeuristic, false},
+		{radar.ScorerDRSModel, radar.ScorerDRSModel, false},
+		// A legacy policy without calibrated_for was calibrated for the heuristic.
+		{"", radar.ScorerDRSModel, true},
+		{radar.ScorerHeuristic, radar.ScorerDRSModel, true},
+		{radar.ScorerDRSModel, radar.ScorerHeuristic, true},
+	}
+	for _, tt := range tests {
+		policy := radar.PullRequestPolicy{CalibratedFor: tt.calibratedFor}
+		err := checkScorerCalibration(policy, tt.scorer)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("calibrated_for=%q scorer=%q: err=%v, wantErr=%t", tt.calibratedFor, tt.scorer, err, tt.wantErr)
+		}
+		if err != nil && (!strings.Contains(err.Error(), tt.scorer) || !strings.Contains(err.Error(), "calibrated_for")) {
+			t.Errorf("error %q should name the scorer and calibrated_for", err)
+		}
+	}
+}
+
+func writeTestPolicy(t *testing.T, policy radar.PullRequestPolicy) string {
+	t.Helper()
+	data, err := json.Marshal(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "policy.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestLoadPullRequestPolicyCalibratedFor(t *testing.T) {
+	policy, err := loadPullRequestPolicy(filepath.Join("..", "..", "examples", "github-policy.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.CalibratedFor != radar.ScorerHeuristic {
+		t.Fatalf("example calibrated_for = %q, want heuristic", policy.CalibratedFor)
+	}
+	policy.CalibratedFor = radar.ScorerDRSModel
+	reloaded, err := loadPullRequestPolicy(writeTestPolicy(t, policy))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.CalibratedFor != radar.ScorerDRSModel {
+		t.Fatalf("calibrated_for = %q", reloaded.CalibratedFor)
+	}
+	policy.CalibratedFor = "bogus"
+	if _, err := loadPullRequestPolicy(writeTestPolicy(t, policy)); err == nil {
+		t.Fatal("unknown calibrated_for must fail to load")
+	}
+}
+
+// captureStderr runs f with os.Stderr redirected to a file and returns what
+// was written.
+func captureStderr(t *testing.T, f func()) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "stderr")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stderr
+	os.Stderr = file
+	defer func() { os.Stderr = old }()
+	f()
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+// TestRunReviewRefusesMismatchedScorer exercises runReview itself: with a
+// policy calibrated for another scorer it must exit 1 before building an agent
+// (no API key is set) or touching GitHub (PATH is empty, so gh cannot run).
+func TestRunReviewRefusesMismatchedScorer(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "")
+	policy, err := loadPullRequestPolicy(filepath.Join("..", "..", "examples", "github-policy.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy.CalibratedFor = radar.ScorerDRSModel
+	path := writeTestPolicy(t, policy)
+
+	var code int
+	stderr := captureStderr(t, func() {
+		code = runReview([]string{"-repo", "owner/repo", "-pr", "1", "-policy", path, "-scorer", radar.ScorerHeuristic})
+	})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, `calibrated_for) but -scorer is "heuristic"`) {
+		t.Fatalf("stderr = %q", stderr)
+	}
+	for _, later := range []string{"OPENAI_API_KEY", "executable file not found", "fetching pull request"} {
+		if strings.Contains(stderr, later) {
+			t.Fatalf("guard must run before agent construction and GitHub calls: %q", stderr)
+		}
+	}
+}
+
+func TestRunReviewRejectsUnknownScorer(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	path := filepath.Join("..", "..", "examples", "github-policy.json")
+	var code int
+	stderr := captureStderr(t, func() {
+		code = runReview([]string{"-repo", "owner/repo", "-pr", "1", "-policy", path, "-agent", "rule-based", "-scorer", "bogus"})
+	})
+	if code != 1 || !strings.Contains(stderr, "calibrated_for") || !strings.Contains(stderr, `"bogus"`) {
+		t.Fatalf("code=%d stderr=%q", code, stderr)
 	}
 }

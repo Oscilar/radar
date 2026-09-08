@@ -187,25 +187,30 @@ type Diff struct {
 	CreatedAt time.Time `json:"created_at,omitempty"`
 }
 
-// LinesChanged returns a rough size measure for the diff: the number of changes
-// weighted by their content length. Used by the heuristic risk scorer.
+// LinesChanged returns a rough size measure for the diff: the sum of each
+// change's line count (see Change.lines). Used by the risk scorers.
 func (d Diff) LinesChanged() int {
 	total := 0
 	for _, c := range d.Changes {
-		if c.Additions > 0 || c.Deletions > 0 {
-			total += c.Additions + c.Deletions
-			continue
-		}
-		// Count newlines plus one as a cheap line estimate.
-		lines := 1
-		for _, r := range c.Content {
-			if r == '\n' {
-				lines++
-			}
-		}
-		total += lines
+		total += c.lines()
 	}
 	return total
+}
+
+// lines returns the change's line count: the provider-reported additions plus
+// deletions when either is set, otherwise newlines in Content plus one as a
+// cheap estimate.
+func (c Change) lines() int {
+	if c.Additions > 0 || c.Deletions > 0 {
+		return c.Additions + c.Deletions
+	}
+	lines := 1
+	for _, r := range c.Content {
+		if r == '\n' {
+			lines++
+		}
+	}
+	return lines
 }
 
 // MaxComplexity returns the highest per-change complexity in the diff.

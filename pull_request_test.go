@@ -1,6 +1,7 @@
 package radar
 
 import (
+	"math"
 	"strings"
 	"testing"
 )
@@ -189,6 +190,109 @@ func TestPathGlob(t *testing.T) {
 		got := matchesAnyPath(tc.path, []string{tc.pattern})
 		if got != tc.want {
 			t.Errorf("matchesAnyPath(%q, %q) = %t, want %t", tc.path, tc.pattern, got, tc.want)
+		}
+	}
+}
+
+// TestPullRequestReviewerWithModelScorer runs the fixture model end to end. The
+// safe input scores -4.7103 (see TestDRSModelScorerGolden); two of the ten
+// calibration values lie strictly below it, so the percentile is exactly 20 and
+// passes a P20 threshold.
+func TestPullRequestReviewerWithModelScorer(t *testing.T) {
+	scorer := loadDRSModelFixture(t, "valid.json")
+	policy := testPullRequestPolicy(PullRequestModeShadow)
+	policy.CalibratedFor = ScorerDRSModel
+	policy.CalibrationSample = []float64{-6, -5, -4, -3, -2, -1, 0, 1, 2, 3}
+	agent := &countingAgent{result: safeAgentResult()}
+	reviewer, err := NewPullRequestReviewer(policy, scorer, agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := reviewer.Review(safePullRequestInput())
+	if got.Action != PullRequestWouldApprove || got.RiskPercentile != 20 {
+		t.Fatalf("got %+v", got)
+	}
+	if got.ModelVersion != "drs-lr-test-0001" {
+		t.Fatalf("model version = %q", got.ModelVersion)
+	}
+	var stage StageResult
+	for _, s := range got.Stages {
+		if s.Name == "pr.risk-threshold" {
+			stage = s
+		}
+	}
+	if !stage.Passed || !strings.Contains(stage.Reason, "scorer drs-model drs-lr-test-0001") {
+		t.Fatalf("risk stage = %+v", stage)
+	}
+
+	// With three sample values below the same score the percentile is 30, the
+	// gate fails, and the safe verdict is only a policy-update candidate: the
+	// outcome is decided by the calibration sample, not the raw logit.
+	policy.CalibrationSample = []float64{-9, -8, -7, -3, -2, -1, 0, 1, 2, 3}
+	reviewer, err = NewPullRequestReviewer(policy, scorer, agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reviewer.Review(safePullRequestInput()); got.Action != PullRequestPolicyCandidate || got.RiskPercentile != 30 || got.ModelVersion != "drs-lr-test-0001" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestPullRequestReviewerHeuristicHasNoModelVersion(t *testing.T) {
+	agent := &countingAgent{result: safeAgentResult()}
+	reviewer, err := NewPullRequestReviewer(testPullRequestPolicy(PullRequestModeShadow), HeuristicScorer{}, agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := reviewer.Review(safePullRequestInput())
+	if got.ModelVersion != "" {
+		t.Fatalf("model version = %q, want empty", got.ModelVersion)
+	}
+	found := false
+	for _, s := range got.Stages {
+		if s.Name == "pr.risk-threshold" && strings.Contains(s.Reason, "(scorer heuristic)") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("risk stage should name the heuristic scorer: %+v", got.Stages)
+	}
+}
+
+func TestPullRequestReviewerNonFiniteScoreFailsClosed(t *testing.T) {
+	for _, score := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		agent := &countingAgent{result: safeAgentResult()}
+		reviewer, err := NewPullRequestReviewer(testPullRequestPolicy(PullRequestModeShadow), fixedScorer(score), agent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := reviewer.Review(safePullRequestInput())
+		if got.Action != PullRequestRouteToHuman || got.Eligible || got.RiskPercentile != -1 {
+			t.Fatalf("score %v: got %+v", score, got)
+		}
+		last := got.Stages[len(got.Stages)-1]
+		if last.Name != "pr.risk-threshold" || last.Passed || !strings.Contains(last.Reason, "non-finite") {
+			t.Fatalf("score %v: last stage = %+v", score, last)
+		}
+		if agent.calls != 0 {
+			t.Fatalf("score %v: agent must not run after a non-finite score, calls=%d", score, agent.calls)
+		}
+	}
+}
+
+func TestPullRequestPolicyValidateCalibratedFor(t *testing.T) {
+	for _, name := range []string{"", ScorerHeuristic, ScorerDRSModel} {
+		policy := testPullRequestPolicy(PullRequestModeShadow)
+		policy.CalibratedFor = name
+		if err := policy.Validate(); err != nil {
+			t.Errorf("calibrated_for %q: %v", name, err)
+		}
+	}
+	for _, name := range []string{"bogus", "Heuristic ", "xgboost"} {
+		policy := testPullRequestPolicy(PullRequestModeShadow)
+		policy.CalibratedFor = name
+		if err := policy.Validate(); err == nil || !strings.Contains(err.Error(), "calibrated_for") {
+			t.Errorf("calibrated_for %q: error = %v", name, err)
 		}
 	}
 }

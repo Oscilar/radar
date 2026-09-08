@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "model_version": "drs-lr-test-unknown-feature",
+  "intercept": 0.0,
+  "features": [
+    {"name": "lines_changed", "transform": "log1p", "mean": 3.0, "scale": 2.0, "coefficient": 1.5},
+    {"name": "cyclomatic_complexity", "transform": "identity", "mean": 0.0, "scale": 1.0, "coefficient": 1.0}
+  ]
+}

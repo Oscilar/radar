@@ -84,6 +84,7 @@ func runReview(args []string) int {
 	prNumber := flags.Int("pr", 0, "pull request number (required)")
 	policyPath := flags.String("policy", "", "path to a versioned JSON policy (required)")
 	agentName := flags.String("agent", "openai", "review agent: openai, anthropic, or rule-based")
+	scorerName := flags.String("scorer", radar.ScorerHeuristic, "risk scorer: "+strings.Join(radar.ScorerNames(), " or "))
 	expectedHead := flags.String("expected-head", "", "event head SHA; required in approval mode")
 	settle := flags.Duration("settle", 10*time.Second, "time between check observations")
 	apply := flags.Bool("apply", false, "allow an APPROVE review when policy mode is approve")
@@ -97,6 +98,10 @@ func runReview(args []string) int {
 
 	policy, err := loadPullRequestPolicy(*policyPath)
 	if err != nil {
+		fmt.Fprintln(os.Stderr, "radar-gh review:", err)
+		return 1
+	}
+	if err := checkScorerCalibration(policy, *scorerName); err != nil {
 		fmt.Fprintln(os.Stderr, "radar-gh review:", err)
 		return 1
 	}
@@ -116,7 +121,12 @@ func runReview(args []string) int {
 		fmt.Fprintln(os.Stderr, "radar-gh review:", err)
 		return 1
 	}
-	reviewer, err := radar.NewPullRequestReviewer(policy, radar.HeuristicScorer{}, agent)
+	scorer, err := radar.NewRiskScorer(*scorerName)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "radar-gh review:", err)
+		return 1
+	}
+	reviewer, err := radar.NewPullRequestReviewer(policy, scorer, agent)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "radar-gh review:", err)
 		return 1
@@ -197,6 +207,21 @@ func loadPullRequestPolicy(path string) (radar.PullRequestPolicy, error) {
 		return policy, err
 	}
 	return policy, nil
+}
+
+// checkScorerCalibration refuses to run a scorer against a calibration sample
+// computed for a different one, since the percentile would be meaningless. A
+// policy without calibrated_for is treated as calibrated for the heuristic
+// scorer, so a model scorer always needs a policy that names it explicitly.
+func checkScorerCalibration(policy radar.PullRequestPolicy, scorerName string) error {
+	calibratedFor := policy.CalibratedFor
+	if calibratedFor == "" {
+		calibratedFor = radar.ScorerHeuristic
+	}
+	if calibratedFor != scorerName {
+		return fmt.Errorf("policy calibration_sample was computed for scorer %q (calibrated_for) but -scorer is %q; recalibrate with `radar calibrate -scorer %s` and set calibrated_for", calibratedFor, scorerName, scorerName)
+	}
+	return nil
 }
 
 func newReviewAgent(name string) (radar.ReviewAgent, error) {

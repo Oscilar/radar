@@ -88,9 +88,13 @@ type PullRequestPolicy struct {
 	MaxChangedLines     int                   `json:"max_changed_lines"`
 	MaxRiskPercentile   float64               `json:"max_risk_percentile"`
 	CalibrationSample   []float64             `json:"calibration_sample"`
-	MinReviewConfidence int                   `json:"min_review_confidence"`
-	IgnoredChecks       []string              `json:"ignored_checks,omitempty"`
-	AllowSkippedChecks  bool                  `json:"allow_skipped_checks,omitempty"`
+	// CalibratedFor names the scorer (see ScorerNames) whose raw scores make up
+	// CalibrationSample. Empty means the policy predates named scorers and its
+	// sample was computed with HeuristicScorer.
+	CalibratedFor       string   `json:"calibrated_for,omitempty"`
+	MinReviewConfidence int      `json:"min_review_confidence"`
+	IgnoredChecks       []string `json:"ignored_checks,omitempty"`
+	AllowSkippedChecks  bool     `json:"allow_skipped_checks,omitempty"`
 }
 
 // PullRequestReview is a strict, machine-readable decision bound to one head.
@@ -105,8 +109,11 @@ type PullRequestReview struct {
 	MatchedRule    string            `json:"matched_rule,omitempty"`
 	RawRiskScore   float64           `json:"raw_risk_score"`
 	RiskPercentile float64           `json:"risk_percentile"`
-	Agent          ACRResult         `json:"agent"`
-	Stages         []StageResult     `json:"stages"`
+	// ModelVersion identifies the trained artifact when the scorer is a model
+	// (see DRSModelScorer.ModelVersion); empty for the heuristic scorer.
+	ModelVersion string        `json:"model_version,omitempty"`
+	Agent        ACRResult     `json:"agent"`
+	Stages       []StageResult `json:"stages"`
 }
 
 // PullRequestReviewer applies a policy with pluggable Radar scoring and review.
@@ -163,6 +170,9 @@ func (p PullRequestPolicy) Validate() error {
 		if math.IsNaN(score) || math.IsInf(score, 0) {
 			return fmt.Errorf("radar: calibration scores must be finite")
 		}
+	}
+	if p.CalibratedFor != "" && !containsFold(ScorerNames(), p.CalibratedFor) {
+		return fmt.Errorf("radar: calibrated_for must be one of %s, got %q", strings.Join(ScorerNames(), ", "), p.CalibratedFor)
 	}
 	if p.MinReviewConfidence < ACRMinConfidence || p.MinReviewConfidence > ACRMaxConfidence {
 		return fmt.Errorf("radar: review confidence must be between %d and %d", ACRMinConfidence, ACRMaxConfidence)
@@ -233,15 +243,18 @@ func (r *PullRequestReviewer) Review(in PullRequestInput) PullRequestReview {
 		out.MatchedRule = rule.Name
 	}
 
+	if versioned, ok := r.scorer.(interface{ ModelVersion() string }); ok {
+		out.ModelVersion = versioned.ModelVersion()
+	}
 	out.RawRiskScore = r.scorer.Score(diff)
 	if math.IsNaN(out.RawRiskScore) || math.IsInf(out.RawRiskScore, 0) {
-		add("pr.risk-threshold", false, "risk scorer returned a non-finite value")
+		add("pr.risk-threshold", false, "risk scorer "+scorerLabel(r.scorer)+" returned a non-finite value")
 		return out
 	}
 	out.RiskPercentile = r.calibrator.Percentile(out.RawRiskScore)
 	riskPassed := out.RiskPercentile <= r.policy.MaxRiskPercentile
 	add("pr.risk-threshold", riskPassed,
-		fmt.Sprintf("risk percentile %.1f vs threshold P%.1f", out.RiskPercentile, r.policy.MaxRiskPercentile))
+		fmt.Sprintf("risk percentile %.1f vs threshold P%.1f (scorer %s)", out.RiskPercentile, r.policy.MaxRiskPercentile, scorerLabel(r.scorer)))
 
 	out.Agent = r.agent.Review(diff)
 	agentPassed := out.Agent.Accept && out.Agent.Confidence >= r.policy.MinReviewConfidence &&
@@ -265,6 +278,19 @@ func (r *PullRequestReviewer) Review(in PullRequestInput) PullRequestReview {
 		out.Action = PullRequestPolicyCandidate
 	}
 	return out
+}
+
+// scorerLabel names the scorer for audit output: its registered name when it
+// has one (else its Go type), plus the model version when it is a model.
+func scorerLabel(s RiskScorer) string {
+	label := fmt.Sprintf("%T", s)
+	if named, ok := s.(interface{ Name() string }); ok {
+		label = named.Name()
+	}
+	if versioned, ok := s.(interface{ ModelVersion() string }); ok {
+		label += " " + versioned.ModelVersion()
+	}
+	return label
 }
 
 func reviewCoversDiff(result ACRResult, diff Diff) bool {

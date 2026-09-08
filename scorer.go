@@ -1,6 +1,7 @@
 package radar
 
 import (
+	"fmt"
 	"math"
 	"sort"
 	"strings"
@@ -15,6 +16,30 @@ type RiskScorer interface {
 	Score(Diff) float64
 }
 
+// Scorer names shared by the CLIs' -scorer flag and
+// PullRequestPolicy.CalibratedFor. A calibration sample is only meaningful for
+// the scorer that produced it, so the name travels with the policy.
+const (
+	ScorerHeuristic = "heuristic"
+	ScorerDRSModel  = "drs-model"
+)
+
+// ScorerNames lists the RiskScorer implementations selectable by name.
+func ScorerNames() []string { return []string{ScorerHeuristic, ScorerDRSModel} }
+
+// NewRiskScorer constructs the RiskScorer registered under name. ScorerDRSModel
+// fails while the embedded artifact is the untrained placeholder.
+func NewRiskScorer(name string) (RiskScorer, error) {
+	switch name {
+	case ScorerHeuristic:
+		return HeuristicScorer{}, nil
+	case ScorerDRSModel:
+		return NewDRSModelScorer()
+	default:
+		return nil, fmt.Errorf("radar: unknown scorer %q (known: %s)", name, strings.Join(ScorerNames(), ", "))
+	}
+}
+
 // HeuristicScorer is a transparent, dependency-free stand-in for Meta's learned
 // DRS model. It is NOT a retrained equivalent — it approximates risk from
 // observable diff features (size, complexity, risky paths, and the presence of
@@ -27,6 +52,10 @@ var riskyPathFragments = []string{
 	"auth", "crypto", "secret", "payment", "billing", "migration", "schema",
 	"security", "prod", "config",
 }
+
+// Name returns the identifier used by the -scorer flag and
+// PullRequestPolicy.CalibratedFor.
+func (HeuristicScorer) Name() string { return ScorerHeuristic }
 
 // Score combines diff features into a raw risk value. The weights are
 // illustrative; what matters is monotonicity (more lines, higher complexity,

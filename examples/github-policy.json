@@ -81,6 +81,7 @@
     34,
     55
   ],
+  "calibrated_for": "heuristic",
   "min_review_confidence": 10,
   "ignored_checks": [
     "github-actions/review"

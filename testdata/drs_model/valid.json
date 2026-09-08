@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "model_version": "drs-lr-test-0001",
+  "trained_at": "2026-09-08T00:00:00Z",
+  "training_run": "synthetic test fixture; these are not trained weights",
+  "intercept": -2.0,
+  "features": [
+    {"name": "lines_changed", "transform": "log1p", "mean": 3.0, "scale": 2.0, "coefficient": 1.5},
+    {"name": "risky_path_files", "transform": "identity", "mean": 0.5, "scale": 0.5, "coefficient": 2.0},
+    {"name": "test_files", "transform": "identity", "mean": 1.0, "scale": 1.0, "coefficient": -0.5}
+  ]
+}
