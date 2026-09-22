@@ -199,7 +199,9 @@ func (a *FireworksAgent) review(ctx context.Context, d Diff) (ACRResult, error) 
 	if fr.Error != nil {
 		return ACRResult{}, fmt.Errorf("fireworks API error: %s", fr.Error.Message)
 	}
-	if fr.Model != "" && fr.Model != a.Model {
+	// A response that does not name the model that served it cannot prove the
+	// configured model produced the verdict, so it fails safe like a mismatch.
+	if fr.Model != a.Model {
 		return ACRResult{}, fmt.Errorf("fireworks served model %q, want %q", fr.Model, a.Model)
 	}
 	if len(fr.Choices) == 0 {
@@ -207,10 +209,12 @@ func (a *FireworksAgent) review(ctx context.Context, d Diff) (ACRResult, error) 
 	}
 	choice := fr.Choices[0]
 	switch choice.FinishReason {
-	case "stop", "":
+	case "stop":
 	case "length":
 		return ACRResult{}, fmt.Errorf("fireworks response truncated at max_tokens=%d", maxTokens)
 	default:
+		// Includes a missing finish_reason: without an explicit stop the
+		// completion cannot be shown to be complete.
 		return ACRResult{}, fmt.Errorf("fireworks finish_reason %q", choice.FinishReason)
 	}
 	text := stripThinkBlock(choice.Message.Content)

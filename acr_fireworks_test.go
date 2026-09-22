@@ -242,6 +242,18 @@ func TestFireworksAgentFailsSafe(t *testing.T) {
 			want:       "served model",
 		},
 		{
+			name:       "served model omitted",
+			statusCode: http.StatusOK,
+			body:       `{"choices":[{"finish_reason":"stop","message":{"content":"` + verdict + `"}}]}`,
+			want:       `served model "", want`,
+		},
+		{
+			name:       "finish reason omitted",
+			statusCode: http.StatusOK,
+			body:       `{"model":"` + fireworksTestModel + `","choices":[{"message":{"content":"` + verdict + `"}}]}`,
+			want:       `finish_reason ""`,
+		},
+		{
 			name:       "refusal",
 			statusCode: http.StatusOK,
 			body:       `{"model":"` + fireworksTestModel + `","choices":[{"finish_reason":"stop","message":{"content":"","refusal":"cannot review"}}]}`,
