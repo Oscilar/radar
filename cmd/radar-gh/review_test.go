@@ -105,3 +105,26 @@ func TestValidateApprovalSnapshot(t *testing.T) {
 		t.Fatal("stale approval protection must block approval")
 	}
 }
+
+func TestNewReviewAgentFireworks(t *testing.T) {
+	t.Setenv("FIREWORKS_API_KEY", "")
+	t.Setenv("RADAR_ACR_MODEL", "")
+	if _, err := newReviewAgent("fireworks"); err == nil || !strings.Contains(err.Error(), "FIREWORKS_API_KEY") {
+		t.Fatalf("missing key must error, got %v", err)
+	}
+	t.Setenv("FIREWORKS_API_KEY", "test-key")
+	if _, err := newReviewAgent("fireworks"); err == nil || !strings.Contains(err.Error(), "RADAR_ACR_MODEL") {
+		t.Fatalf("missing model must error, got %v", err)
+	}
+	t.Setenv("RADAR_ACR_MODEL", "accounts/fireworks/models/glm-5p3")
+	agent, err := newReviewAgent("fireworks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := agent.(*radar.FireworksAgent); !ok {
+		t.Fatalf("agent = %T, want *radar.FireworksAgent", agent)
+	}
+	if _, err := newReviewAgent("bogus"); err == nil {
+		t.Fatal("unknown agent must error")
+	}
+}

@@ -245,3 +245,6 @@ func parseACRVerdict(text string) (ACRResult, error) {
 	res.Accept = v.Accept && v.Confidence >= ACRMinConfidence && len(res.RiskSignals) == 0 && len(res.SafeSignals) > 0 && len(res.ReviewedFiles) > 0 && !blockingFinding
 	return res, nil
 }
+
+// Describe names the provider and model for decision provenance.
+func (a *LLMAgent) Describe() string { return "anthropic/" + a.Model }

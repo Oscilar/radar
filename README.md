@@ -105,9 +105,12 @@ The two pieces that are proprietary/ML at Meta are interfaces here:
   explicitly empty calibrator fails closed (everything routes to human).
 - **`ReviewAgent`** — the Automated Code Review (ACR). `RuleBasedAgent` (default,
   offline, deterministic) classifies the paper's safe/risk signal taxonomy from
-  structured change tags. `LLMAgent` (Anthropic) and `OpenAIAgent` (OpenAI) are
-  optional API-backed adapters behind the same interface; both fail safe (route
-  to human) on any error.
+  structured change tags. `LLMAgent` (Anthropic), `OpenAIAgent` (OpenAI), and
+  `FireworksAgent` (open-weight models served by Fireworks AI) are optional
+  API-backed adapters behind the same interface; all fail safe (route to human)
+  on any error. Every agent reports a provenance string (`rule-based`,
+  `openai/<model>`, `anthropic/<model>`, `fireworks/<model>`) that
+  `PullRequestReview` records as `reviewer`.
 
 Per-org risk appetite (`OrgPolicyConfig`, modeling `OrgRADARPolicyConfig`) and
 per-runbook eligibility (60-day risk history, daily limits, denylist) are
@@ -163,7 +166,7 @@ radar-gh review \
   -pr 123 \
   -policy .github/radar-policy.json \
   -expected-head "$HEAD_SHA" \
-  -agent openai
+  -agent openai      # or anthropic, fireworks, rule-based
 ```
 
 The default example policy is `shadow`: a qualifying change produces
@@ -196,7 +199,18 @@ an approval bound to that commit. The initial shadow rollout intentionally does
 not require or enable stale-approval dismissal.
 
 The `openai` agent uses `$OPENAI_API_KEY`; `anthropic` uses
-`$ANTHROPIC_API_KEY`. Use a dedicated GitHub App or service account token with
+`$ANTHROPIC_API_KEY`; `fireworks` uses `$FIREWORKS_API_KEY` **and requires**
+`$RADAR_ACR_MODEL` set to a full Fireworks model id (for example
+`accounts/fireworks/models/glm-5p3` or `accounts/fireworks/models/kimi-k2p7-code`).
+There is deliberately no default Fireworks model: the platform serves many
+interchangeable open-weight models, and the one doing the reviewing should
+change only through an explicit configuration change. The adapter calls the
+OpenAI-compatible Chat Completions endpoint with `temperature: 0` and a
+`json_schema` response format, and fails safe when the response is truncated at
+`max_tokens` (`$RADAR_ACR_MAX_TOKENS`, default 8192 to leave room for reasoning
+models), when the served `model` differs from the requested one, or when the
+verdict does not parse. `$FIREWORKS_BASE_URL` points it at another
+OpenAI-compatible Chat Completions endpoint. Use a dedicated GitHub App or service account token with
 read access to repository contents, checks, pull requests, and review threads.
 Approval mode additionally needs branch-protection read access and pull-request
 review write access.

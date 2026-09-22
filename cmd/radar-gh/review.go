@@ -83,7 +83,7 @@ func runReview(args []string) int {
 	repo := flags.String("repo", "", "GitHub owner/repository (required)")
 	prNumber := flags.Int("pr", 0, "pull request number (required)")
 	policyPath := flags.String("policy", "", "path to a versioned JSON policy (required)")
-	agentName := flags.String("agent", "openai", "review agent: openai, anthropic, or rule-based")
+	agentName := flags.String("agent", "openai", "review agent: openai, anthropic, fireworks, or rule-based")
 	expectedHead := flags.String("expected-head", "", "event head SHA; required in approval mode")
 	settle := flags.Duration("settle", 10*time.Second, "time between check observations")
 	apply := flags.Bool("apply", false, "allow an APPROVE review when policy mode is approve")
@@ -205,6 +205,8 @@ func newReviewAgent(name string) (radar.ReviewAgent, error) {
 		return radar.NewOpenAIAgent()
 	case "anthropic":
 		return radar.NewLLMAgent()
+	case "fireworks":
+		return radar.NewFireworksAgent()
 	case "rule-based":
 		return radar.RuleBasedAgent{}, nil
 	default:

@@ -168,3 +168,21 @@ func (RuleBasedAgent) Review(d Diff) ACRResult {
 	}
 	return res
 }
+
+// ReviewAgentDescriber is implemented by agents that can name the provider and
+// model behind a verdict, so decision records carry review provenance.
+type ReviewAgentDescriber interface {
+	Describe() string
+}
+
+// Describe names the agent for decision provenance.
+func (RuleBasedAgent) Describe() string { return "rule-based" }
+
+// describeReviewAgent returns the agent's provenance string, or "" for agents
+// that do not describe themselves.
+func describeReviewAgent(agent ReviewAgent) string {
+	if d, ok := agent.(ReviewAgentDescriber); ok {
+		return d.Describe()
+	}
+	return ""
+}
