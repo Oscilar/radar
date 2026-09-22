@@ -192,3 +192,36 @@ func TestPathGlob(t *testing.T) {
 		}
 	}
 }
+
+type describedAgent struct{ RuleBasedAgent }
+
+func (describedAgent) Describe() string { return "fireworks/accounts/fireworks/models/test" }
+
+func TestPullRequestReviewRecordsReviewer(t *testing.T) {
+	tests := []struct {
+		name  string
+		agent ReviewAgent
+		want  string
+	}{
+		{name: "rule-based names itself", agent: RuleBasedAgent{}, want: "rule-based"},
+		{name: "described agent", agent: describedAgent{}, want: "fireworks/accounts/fireworks/models/test"},
+		{name: "undescribed agent stays blank", agent: staticAgent{}, want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reviewer, err := NewPullRequestReviewer(testPullRequestPolicy(PullRequestModeShadow), fixedScorer(0), tt.agent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// An ineligible input still records who would have reviewed it.
+			out := reviewer.Review(PullRequestInput{ID: "x", HeadSHA: "abc", Open: false})
+			if out.Reviewer != tt.want {
+				t.Fatalf("reviewer = %q, want %q", out.Reviewer, tt.want)
+			}
+		})
+	}
+}
+
+type staticAgent struct{}
+
+func (staticAgent) Review(Diff) ACRResult { return ACRResult{Summary: "static"} }

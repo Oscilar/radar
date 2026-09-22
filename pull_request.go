@@ -105,8 +105,11 @@ type PullRequestReview struct {
 	MatchedRule    string            `json:"matched_rule,omitempty"`
 	RawRiskScore   float64           `json:"raw_risk_score"`
 	RiskPercentile float64           `json:"risk_percentile"`
-	Agent          ACRResult         `json:"agent"`
-	Stages         []StageResult     `json:"stages"`
+	// Reviewer names the ACR provider and model that produced Agent, e.g.
+	// "openai/gpt-4o-mini" or "fireworks/accounts/fireworks/models/glm-5p3".
+	Reviewer string        `json:"reviewer,omitempty"`
+	Agent    ACRResult     `json:"agent"`
+	Stages   []StageResult `json:"stages"`
 }
 
 // PullRequestReviewer applies a policy with pluggable Radar scoring and review.
@@ -208,6 +211,7 @@ func (r *PullRequestReviewer) Review(in PullRequestInput) PullRequestReview {
 		Mode:           r.policy.Mode,
 		Action:         PullRequestRouteToHuman,
 		RiskPercentile: -1,
+		Reviewer:       describeReviewAgent(r.agent),
 	}
 	add := func(name string, passed bool, reason string) bool {
 		out.Stages = append(out.Stages, StageResult{Name: name, Passed: passed, Reason: reason})

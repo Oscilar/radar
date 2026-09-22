@@ -85,7 +85,9 @@ type openAIResponsesResp struct {
 	} `json:"error"`
 }
 
-func openAIACRVerdictSchema() map[string]any {
+// acrVerdictSchema is the JSON Schema of the ACR verdict, shared by every
+// structured-output adapter (OpenAI, Fireworks).
+func acrVerdictSchema() map[string]any {
 	stringArray := func(values ...string) map[string]any {
 		items := map[string]any{"type": "string"}
 		if len(values) > 0 {
@@ -186,7 +188,7 @@ func (a *OpenAIAgent) review(ctx context.Context, d Diff) (ACRResult, error) {
 				Type:   "json_schema",
 				Name:   "radar_acr_verdict",
 				Strict: true,
-				Schema: openAIACRVerdictSchema(),
+				Schema: acrVerdictSchema(),
 			},
 		},
 	}
@@ -253,3 +255,6 @@ func (a *OpenAIAgent) review(ctx context.Context, d Diff) (ACRResult, error) {
 	}
 	return parseACRVerdict(text.String())
 }
+
+// Describe names the provider and model for decision provenance.
+func (a *OpenAIAgent) Describe() string { return "openai/" + a.Model }
