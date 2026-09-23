@@ -379,7 +379,7 @@ func TestFireworksAgentRecordsElapsed(t *testing.T) {
 	defer server.Close()
 	agent := &FireworksAgent{APIKey: "test-key", Model: fireworksTestModel, BaseURL: server.URL, HTTP: server.Client()}
 	result := agent.Review(Diff{Changes: []Change{{File: "a.go"}}})
-	if result.Summary != "needs a human" || result.ElapsedMS < 20 {
+	if result.Summary != "needs a human" || result.ElapsedMS == nil || *result.ElapsedMS < 20 {
 		t.Fatalf("unexpected result: %+v", result)
 	}
 }
@@ -395,7 +395,26 @@ func TestFireworksAgentTimeoutFailsSafeAndRecordsElapsed(t *testing.T) {
 	}()
 	agent := &FireworksAgent{APIKey: "test-key", Model: fireworksTestModel, BaseURL: server.URL, Timeout: 50 * time.Millisecond, HTTP: &http.Client{}}
 	result := agent.Review(Diff{})
-	if result.Accept || !strings.Contains(result.Summary, "failing safe") || result.ElapsedMS < 50 {
+	if result.Accept || !strings.Contains(result.Summary, "failing safe") || result.ElapsedMS == nil || *result.ElapsedMS < 50 {
 		t.Fatalf("deadline must fail safe and record elapsed: %+v", result)
+	}
+}
+
+func TestFireworksAgentEmitsElapsedEvenWhenZero(t *testing.T) {
+	agent := &FireworksAgent{APIKey: "test-key"}
+	result := agent.Review(Diff{})
+	if result.Accept || result.ElapsedMS == nil {
+		t.Fatalf("an immediate failure must still record elapsed: %+v", result)
+	}
+	out, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), `"elapsed_ms":`) {
+		t.Fatalf("elapsed_ms missing from %s", out)
+	}
+	rule, _ := json.Marshal(RuleBasedAgent{}.Review(Diff{}))
+	if strings.Contains(string(rule), "elapsed_ms") {
+		t.Fatalf("agents that do not measure latency must omit elapsed_ms: %s", rule)
 	}
 }

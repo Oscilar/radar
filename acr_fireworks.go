@@ -153,7 +153,8 @@ func (a *FireworksAgent) Review(d Diff) ACRResult {
 	if err != nil {
 		res = ACRResult{Accept: false, Confidence: 0, Summary: "ACR Fireworks error, failing safe: " + err.Error()}
 	}
-	res.ElapsedMS = time.Since(start).Milliseconds()
+	elapsed := time.Since(start).Milliseconds()
+	res.ElapsedMS = &elapsed
 	return res
 }
 
