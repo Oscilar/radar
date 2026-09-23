@@ -53,7 +53,7 @@ const (
 	// defaultFireworksMaxTokens leaves room for reasoning models, which spend
 	// tokens thinking before the (small) JSON verdict. Fireworks' own default is
 	// 2048, which a reasoning model can exhaust before it emits any verdict.
-	defaultFireworksMaxTokens = 8192
+	defaultFireworksMaxTokens = 16384
 	defaultFireworksTimeout   = 240 * time.Second
 )
 
