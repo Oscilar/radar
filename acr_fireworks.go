@@ -38,9 +38,13 @@ type FireworksAgent struct {
 	// spends before the verdict. Defaults to $RADAR_ACR_MAX_TOKENS or
 	// defaultFireworksMaxTokens. A response cut off at this cap fails safe.
 	MaxTokens int
-	// HTTP is the client used for requests. Defaults to a 60s-timeout client.
-	// Review additionally enforces a reviewTimeout deadline per call, so a
-	// caller-supplied client without a Timeout cannot block the funnel forever.
+	// Timeout bounds one review call end to end. Defaults to $RADAR_ACR_TIMEOUT
+	// or defaultFireworksTimeout; reasoning models routinely need longer than
+	// the 60s the other adapters use.
+	Timeout time.Duration
+	// HTTP is the client used for requests. Defaults to a client whose timeout
+	// matches Timeout. Review enforces Timeout as a context deadline as well, so
+	// a caller-supplied client without a Timeout cannot block the funnel forever.
 	HTTP *http.Client
 }
 
@@ -49,7 +53,8 @@ const (
 	// defaultFireworksMaxTokens leaves room for reasoning models, which spend
 	// tokens thinking before the (small) JSON verdict. Fireworks' own default is
 	// 2048, which a reasoning model can exhaust before it emits any verdict.
-	defaultFireworksMaxTokens = 8192
+	defaultFireworksMaxTokens = 16384
+	defaultFireworksTimeout   = 240 * time.Second
 )
 
 // NewFireworksAgent constructs a FireworksAgent from the environment
@@ -76,12 +81,21 @@ func NewFireworksAgent() (*FireworksAgent, error) {
 		}
 		maxTokens = n
 	}
+	timeout := defaultFireworksTimeout
+	if raw := strings.TrimSpace(os.Getenv("RADAR_ACR_TIMEOUT")); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d <= 0 {
+			return nil, fmt.Errorf("radar: RADAR_ACR_TIMEOUT must be a positive duration such as 240s, got %q", raw)
+		}
+		timeout = d
+	}
 	return &FireworksAgent{
 		APIKey:    key,
 		Model:     model,
 		BaseURL:   baseURL,
 		MaxTokens: maxTokens,
-		HTTP:      &http.Client{Timeout: 60 * time.Second},
+		Timeout:   timeout,
+		HTTP:      &http.Client{Timeout: timeout},
 	}, nil
 }
 
@@ -128,12 +142,19 @@ type fireworksChatResp struct {
 // Review sends the diff to the Fireworks-served model and returns the parsed
 // verdict, failing safe (non-accept) on any error.
 func (a *FireworksAgent) Review(d Diff) ACRResult {
-	ctx, cancel := context.WithTimeout(context.Background(), reviewTimeout)
+	timeout := a.Timeout
+	if timeout <= 0 {
+		timeout = defaultFireworksTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	start := time.Now()
 	res, err := a.review(ctx, d)
 	if err != nil {
-		return ACRResult{Accept: false, Confidence: 0, Summary: "ACR Fireworks error, failing safe: " + err.Error()}
+		res = ACRResult{Accept: false, Confidence: 0, Summary: "ACR Fireworks error, failing safe: " + err.Error()}
 	}
+	elapsed := time.Since(start).Milliseconds()
+	res.ElapsedMS = &elapsed
 	return res
 }
 
@@ -143,7 +164,7 @@ func (a *FireworksAgent) review(ctx context.Context, d Diff) (ACRResult, error) 
 	}
 	client := a.HTTP
 	if client == nil {
-		client = &http.Client{Timeout: 60 * time.Second}
+		client = &http.Client{}
 	}
 	url := a.BaseURL
 	if url == "" {

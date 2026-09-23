@@ -207,8 +207,9 @@ interchangeable open-weight models, and the one doing the reviewing should
 change only through an explicit configuration change. The adapter calls the
 OpenAI-compatible Chat Completions endpoint with `temperature: 0` and a
 `json_schema` response format, and fails safe when the response is truncated at
-`max_tokens` (`$RADAR_ACR_MAX_TOKENS`, default 8192 to leave room for reasoning
-models), when the served `model` differs from the requested one, or when the
+`max_tokens` (`$RADAR_ACR_MAX_TOKENS`, default 16384 to leave room for reasoning
+models), when a review exceeds its deadline (`$RADAR_ACR_TIMEOUT`, a Go
+duration, default `240s`; each verdict records `elapsed_ms`), when the served `model` differs from the requested one, or when the
 verdict does not parse. `$FIREWORKS_BASE_URL` points it at another
 OpenAI-compatible Chat Completions endpoint. Use a dedicated GitHub App or service account token with
 read access to repository contents, checks, pull requests, and review threads.

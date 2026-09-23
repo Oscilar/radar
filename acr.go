@@ -86,6 +86,10 @@ type ACRResult struct {
 	Findings []ReviewFinding `json:"findings,omitempty"`
 	// Summary is a short human-readable explanation.
 	Summary string `json:"summary"`
+	// ElapsedMS is how long the agent took to produce the verdict. It is set by
+	// agents that measure latency (always, even when it rounds to 0) and nil for
+	// agents that do not, so the two cases stay distinguishable in decisions.
+	ElapsedMS *int64 `json:"elapsed_ms,omitempty"`
 }
 
 // ReviewFinding is one structured issue found by a ReviewAgent.
