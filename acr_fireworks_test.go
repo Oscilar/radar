@@ -334,3 +334,68 @@ func TestFireworksAgentFailsSafeOnTimeout(t *testing.T) {
 		t.Fatalf("timeout must fail safe: %+v", result)
 	}
 }
+
+func TestNewFireworksAgentTimeout(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "default", want: defaultFireworksTimeout},
+		{name: "override", raw: "90s", want: 90 * time.Second},
+		{name: "minutes", raw: "5m", want: 5 * time.Minute},
+		{name: "not a duration", raw: "240", wantErr: true},
+		{name: "zero", raw: "0s", wantErr: true},
+		{name: "negative", raw: "-1s", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("FIREWORKS_API_KEY", "test-key")
+			t.Setenv("RADAR_ACR_MODEL", fireworksTestModel)
+			t.Setenv("RADAR_ACR_TIMEOUT", tt.raw)
+			agent, err := NewFireworksAgent()
+			if tt.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "RADAR_ACR_TIMEOUT") {
+					t.Fatalf("err = %v, want RADAR_ACR_TIMEOUT error", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if agent.Timeout != tt.want || agent.HTTP.Timeout != tt.want {
+				t.Fatalf("timeout = %v / http %v, want %v", agent.Timeout, agent.HTTP.Timeout, tt.want)
+			}
+		})
+	}
+}
+
+func TestFireworksAgentRecordsElapsed(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(20 * time.Millisecond)
+		_, _ = w.Write([]byte(`{"model":"` + fireworksTestModel + `","choices":[{"finish_reason":"stop","message":{"content":"{\"accept\":false,\"confidence\":5,\"risk_signals\":[],\"safe_signals\":[],\"reviewed_files\":[\"a.go\"],\"findings\":[],\"summary\":\"needs a human\"}"}}]}`))
+	}))
+	defer server.Close()
+	agent := &FireworksAgent{APIKey: "test-key", Model: fireworksTestModel, BaseURL: server.URL, HTTP: server.Client()}
+	result := agent.Review(Diff{Changes: []Change{{File: "a.go"}}})
+	if result.Summary != "needs a human" || result.ElapsedMS < 20 {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+}
+
+func TestFireworksAgentTimeoutFailsSafeAndRecordsElapsed(t *testing.T) {
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-release
+	}))
+	defer func() {
+		close(release)
+		server.Close()
+	}()
+	agent := &FireworksAgent{APIKey: "test-key", Model: fireworksTestModel, BaseURL: server.URL, Timeout: 50 * time.Millisecond, HTTP: &http.Client{}}
+	result := agent.Review(Diff{})
+	if result.Accept || !strings.Contains(result.Summary, "failing safe") || result.ElapsedMS < 50 {
+		t.Fatalf("deadline must fail safe and record elapsed: %+v", result)
+	}
+}
