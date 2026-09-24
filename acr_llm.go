@@ -65,7 +65,7 @@ SAFE signals (non-functional or low-risk): refactor-no-behavior-change, dead-cod
 
 RISK signals (require a human): high-review-effort, structural-change, bug-or-logic-error, performance-risk, secrets-exposure, sql-injection, auth-bypass.
 
-Auto-accept ONLY if your confidence is at least 8/10, every change has a recognized safe signal, there are zero risk signals, and there are no P0, P1, or P2 findings. If any of those conditions fail, do not accept.
+Auto-accept ONLY if your confidence is at least 8/10, every change has a recognized safe signal, there are zero risk signals, and there are no P0 or P1 findings. If any of those conditions fail, do not accept. Still report every P2 and P3 finding you see: Radar's policy decides whether they block, so do not decline solely because of a P2 or P3 finding.
 
 Respond with ONLY a JSON object, no prose, of the form:
 {"accept": bool, "confidence": int 0-10, "risk_signals": [string], "safe_signals": [string], "reviewed_files": [string], "findings": [{"severity":"P0|P1|P2|P3", "title":string, "file":string, "line":int, "summary":string}], "summary": string}
