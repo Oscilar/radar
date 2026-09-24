@@ -91,6 +91,10 @@ type PullRequestPolicy struct {
 	MinReviewConfidence int                   `json:"min_review_confidence"`
 	IgnoredChecks       []string              `json:"ignored_checks,omitempty"`
 	AllowSkippedChecks  bool                  `json:"allow_skipped_checks,omitempty"`
+	// BlockingFindingSeverities lists the review-finding severities that stop
+	// an approval. Empty means P0, P1 and P2, the original criterion. It must
+	// always include P0 and P1.
+	BlockingFindingSeverities []string `json:"blocking_finding_severities,omitempty"`
 }
 
 // PullRequestReview is a strict, machine-readable decision bound to one head.
@@ -170,6 +174,18 @@ func (p PullRequestPolicy) Validate() error {
 	if p.MinReviewConfidence < ACRMinConfidence || p.MinReviewConfidence > ACRMaxConfidence {
 		return fmt.Errorf("radar: review confidence must be between %d and %d", ACRMinConfidence, ACRMaxConfidence)
 	}
+	if len(p.BlockingFindingSeverities) > 0 {
+		seen := map[string]bool{}
+		for _, s := range p.BlockingFindingSeverities {
+			if !containsFold([]string{"P0", "P1", "P2", "P3"}, s) {
+				return fmt.Errorf("radar: unknown blocking finding severity %q", s)
+			}
+			seen[strings.ToUpper(s)] = true
+		}
+		if !seen["P0"] || !seen["P1"] {
+			return fmt.Errorf("radar: blocking finding severities must include P0 and P1")
+		}
+	}
 	seen := map[string]bool{}
 	for _, r := range p.AllowRules {
 		if strings.TrimSpace(r.Name) == "" || seen[r.Name] {
@@ -248,13 +264,15 @@ func (r *PullRequestReviewer) Review(in PullRequestInput) PullRequestReview {
 		fmt.Sprintf("risk percentile %.1f vs threshold P%.1f", out.RiskPercentile, r.policy.MaxRiskPercentile))
 
 	out.Agent = r.agent.Review(diff)
-	agentPassed := out.Agent.Accept && out.Agent.Confidence >= r.policy.MinReviewConfidence &&
+	blocking := r.policy.blockingSeverities()
+	claimed := out.Agent.Accept || out.Agent.ModelAccept
+	agentPassed := claimed && out.Agent.Confidence >= r.policy.MinReviewConfidence &&
 		len(out.Agent.RiskSignals) == 0 && len(out.Agent.SafeSignals) > 0 &&
-		reviewCoversDiff(out.Agent, diff) && !hasBlockingFinding(out.Agent.Findings)
+		reviewCoversDiff(out.Agent, diff) && !hasBlockingFinding(out.Agent.Findings, blocking)
 	add("pr.review-agent", agentPassed,
-		fmt.Sprintf("accept=%t confidence=%d/%d risk-signals=%d reviewed-files=%d/%d blocking-findings=%t: %s",
-			out.Agent.Accept, out.Agent.Confidence, r.policy.MinReviewConfidence, len(out.Agent.RiskSignals),
-			len(out.Agent.ReviewedFiles), len(diff.Changes), hasBlockingFinding(out.Agent.Findings), out.Agent.Summary))
+		fmt.Sprintf("accept=%t confidence=%d/%d risk-signals=%d reviewed-files=%d/%d blocking-findings(%s)=%t: %s",
+			claimed, out.Agent.Confidence, r.policy.MinReviewConfidence, len(out.Agent.RiskSignals),
+			len(out.Agent.ReviewedFiles), len(diff.Changes), strings.Join(blocking, ","), hasBlockingFinding(out.Agent.Findings, blocking), out.Agent.Summary))
 
 	out.Eligible = !denied && allowlisted && riskPassed
 	if out.Eligible && agentPassed {
@@ -291,9 +309,22 @@ func reviewCoversDiff(result ACRResult, diff Diff) bool {
 	return true
 }
 
-func hasBlockingFinding(findings []ReviewFinding) bool {
+// blockingSeverities returns the finding severities that block approval,
+// defaulting to P0-P2 for policies that predate the setting.
+func (p PullRequestPolicy) blockingSeverities() []string {
+	if len(p.BlockingFindingSeverities) == 0 {
+		return []string{"P0", "P1", "P2"}
+	}
+	out := make([]string, 0, len(p.BlockingFindingSeverities))
+	for _, s := range p.BlockingFindingSeverities {
+		out = append(out, strings.ToUpper(s))
+	}
+	return out
+}
+
+func hasBlockingFinding(findings []ReviewFinding, blocking []string) bool {
 	for _, finding := range findings {
-		if strings.EqualFold(finding.Severity, "P0") || strings.EqualFold(finding.Severity, "P1") || strings.EqualFold(finding.Severity, "P2") {
+		if containsFold(blocking, finding.Severity) {
 			return true
 		}
 	}

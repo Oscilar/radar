@@ -184,6 +184,13 @@ paginated GitHub state:
 - no review requests changes and no review thread is unresolved;
 - the calibrated risk threshold and strict LLM review both pass.
 
+The review gate needs the model's own accept claim, confidence of at least
+`min_review_confidence`, no risk signals, at least one safe signal, full file
+coverage, and no finding whose severity is in `blocking_finding_severities`
+(default `["P0","P1","P2"]`; it must always include P0 and P1). A policy that
+sets `["P0","P1"]` lets a change with only P2/P3 findings through; the decision
+records `model_accept` and the severities applied.
+
 The LLM can veto an allowlisted change. A strong safe verdict outside the
 deterministic allowlist is only reported as a `policy-update-candidate`; it
 cannot approve the PR. Copy [the generic policy](examples/github-policy.json)

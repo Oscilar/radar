@@ -208,6 +208,7 @@ func parseACRVerdict(text string) (ACRResult, error) {
 		return ACRResult{}, fmt.Errorf("ACR summary is required")
 	}
 	res := ACRResult{
+		ModelAccept:   v.Accept,
 		Confidence:    v.Confidence,
 		ReviewedFiles: v.ReviewedFiles,
 		Findings:      v.Findings,
