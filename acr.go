@@ -73,6 +73,10 @@ func isRiskSignal(s ChangeSignal) bool { return riskSignalSet[s] }
 type ACRResult struct {
 	// Accept is the agent's auto-accept decision.
 	Accept bool `json:"accept"`
+	// ModelAccept is the model's own accept claim before Radar applies its
+	// fixed acceptance criterion. Policies that relax which finding severities
+	// block (see PullRequestPolicy.BlockingFindingSeverities) decide from it.
+	ModelAccept bool `json:"model_accept,omitempty"`
 	// Confidence is the agent's confidence on a 0–10 scale.
 	Confidence int `json:"confidence"`
 	// RiskSignals are the risk signals the agent found.

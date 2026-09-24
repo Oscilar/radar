@@ -225,3 +225,66 @@ func TestPullRequestReviewRecordsReviewer(t *testing.T) {
 type staticAgent struct{}
 
 func (staticAgent) Review(Diff) ACRResult { return ACRResult{Summary: "static"} }
+
+type fixedVerdictAgent struct{ res ACRResult }
+
+func (a fixedVerdictAgent) Review(Diff) ACRResult { return a.res }
+
+func TestPullRequestBlockingFindingSeverities(t *testing.T) {
+	p2Verdict := ACRResult{
+		Accept:        false,
+		ModelAccept:   true,
+		Confidence:    10,
+		SafeSignals:   []ChangeSignal{SignalDocCommentUpdate},
+		ReviewedFiles: []string{"docs/setup.md"},
+		Findings:      []ReviewFinding{{Severity: "P2", Title: "nit", Summary: "worth a look"}},
+		Summary:       "docs",
+	}
+	p1Verdict := p2Verdict
+	p1Verdict.Findings = []ReviewFinding{{Severity: "P1", Title: "bug", Summary: "breaks"}}
+	declined := p2Verdict
+	declined.ModelAccept = false
+	declined.Findings = nil
+
+	tests := []struct {
+		name     string
+		blocking []string
+		verdict  ACRResult
+		want     PullRequestAction
+	}{
+		{name: "default blocks P2", verdict: p2Verdict, want: PullRequestRouteToHuman},
+		{name: "P0/P1 policy lets P2 through", blocking: []string{"P0", "P1"}, verdict: p2Verdict, want: PullRequestWouldApprove},
+		{name: "P0/P1 policy still blocks P1", blocking: []string{"P0", "P1"}, verdict: p1Verdict, want: PullRequestRouteToHuman},
+		{name: "model declined", blocking: []string{"P0", "P1"}, verdict: declined, want: PullRequestRouteToHuman},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			policy := testPullRequestPolicy(PullRequestModeShadow)
+			policy.BlockingFindingSeverities = tt.blocking
+			reviewer, err := NewPullRequestReviewer(policy, fixedScorer(0), fixedVerdictAgent{tt.verdict})
+			if err != nil {
+				t.Fatal(err)
+			}
+			out := reviewer.Review(safePullRequestInput())
+			if out.Action != tt.want {
+				t.Fatalf("action = %s, want %s; stages %+v", out.Action, tt.want, out.Stages)
+			}
+		})
+	}
+}
+
+func TestPullRequestPolicyValidatesBlockingSeverities(t *testing.T) {
+	for _, tt := range []struct {
+		sev     []string
+		wantErr bool
+	}{
+		{nil, false}, {[]string{"P0", "P1"}, false}, {[]string{"p0", "p1", "p2"}, false},
+		{[]string{"P0"}, true}, {[]string{"P1", "P2"}, true}, {[]string{"P0", "P1", "P9"}, true},
+	} {
+		p := testPullRequestPolicy(PullRequestModeShadow)
+		p.BlockingFindingSeverities = tt.sev
+		if err := p.Validate(); (err != nil) != tt.wantErr {
+			t.Errorf("severities %v: err = %v, wantErr %t", tt.sev, err, tt.wantErr)
+		}
+	}
+}

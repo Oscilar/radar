@@ -176,3 +176,19 @@ func TestOpenAIAgentFailsSafeOnResponsesErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestACRPromptLeavesP2DecisionToPolicy(t *testing.T) {
+	if !strings.Contains(acrSystemPrompt, "no P0 or P1 findings") || strings.Contains(acrSystemPrompt, "no P0, P1, or P2 findings") {
+		t.Fatal("the prompt must not make the model veto on P2; blocking_finding_severities decides that")
+	}
+}
+
+func TestParseACRVerdictKeepsP2BlockingByDefault(t *testing.T) {
+	res, err := parseACRVerdict(`{"accept":true,"confidence":9,"risk_signals":[],"safe_signals":["doc-comment-update"],"reviewed_files":["a.md"],"findings":[{"severity":"P2","title":"t","file":"a.md","line":1,"summary":"s"}],"summary":"docs"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Accept || !res.ModelAccept {
+		t.Fatalf("P2 must still block Accept while ModelAccept keeps the claim: %+v", res)
+	}
+}
