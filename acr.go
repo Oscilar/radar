@@ -14,6 +14,13 @@ const (
 	SignalImportHygiene            ChangeSignal = "import-hygiene"
 	SignalTestAddition             ChangeSignal = "test-addition"
 	SignalStaticResourceUpdate     ChangeSignal = "static-resource-update"
+	// SignalConfigTuning is a deliberate adjustment to an operational value
+	// (resource limit, replica count, timeout, retry budget, threshold, pool
+	// size) with no new code path.
+	SignalConfigTuning ChangeSignal = "config-tuning"
+	// SignalObservabilityChange changes alerts, dashboards, metrics, or log
+	// levels without changing what the service does.
+	SignalObservabilityChange ChangeSignal = "observability-change"
 )
 
 // Risk-signal taxonomy (paper §2.4). The presence of ANY risk signal
@@ -51,6 +58,8 @@ var safeSignalSet = map[ChangeSignal]bool{
 	SignalImportHygiene:            true,
 	SignalTestAddition:             true,
 	SignalStaticResourceUpdate:     true,
+	SignalConfigTuning:             true,
+	SignalObservabilityChange:      true,
 }
 
 var riskSignalSet = map[ChangeSignal]bool{

@@ -120,6 +120,8 @@ func acrVerdictSchema() map[string]any {
 				string(SignalImportHygiene),
 				string(SignalTestAddition),
 				string(SignalStaticResourceUpdate),
+				string(SignalConfigTuning),
+				string(SignalObservabilityChange),
 			),
 			"reviewed_files": map[string]any{
 				"type":     "array",
