@@ -61,9 +61,17 @@ const acrSystemPrompt = `You are RADAR's Automated Code Review (ACR) agent. Deci
 
 Classify the diff against these taxonomies.
 
-SAFE signals (non-functional or low-risk): refactor-no-behavior-change, dead-code-removal, defensive-programming, logging-addition, pure-formatting, doc-comment-update, import-hygiene, test-addition, static-resource-update.
+SAFE signals (non-functional or low-risk): refactor-no-behavior-change, dead-code-removal, defensive-programming, logging-addition, pure-formatting, doc-comment-update, import-hygiene, test-addition, static-resource-update, config-tuning, observability-change.
+- config-tuning: a deliberate change to an operational value such as a resource limit, replica count, timeout, retry budget, threshold, or pool size, with no new code path. Intentionally changing how much or how often is not a risk by itself.
+- observability-change: changes to alerts, alert selectors or thresholds, dashboards, metrics, or log levels that do not change what the service does.
 
 RISK signals (require a human): high-review-effort, structural-change, bug-or-logic-error, performance-risk, secrets-exposure, sql-injection, auth-bypass.
+- A change in behaviour that the author clearly intends, and that the diff implements correctly and narrowly, is not a risk signal. Judge whether the change is likely to be wrong or dangerous, not whether it changes something.
+- bug-or-logic-error: you believe the change introduces a defect or does not do what it intends. Do not use it for a correct fix.
+- structural-change: changes to public interfaces, data models or schemas, persistence, cross-service contracts, control flow across components, or architecture. A single value or a scoped conditional is not structural.
+- high-review-effort: the change is large or intricate enough that a careful human review would take substantial time. Small diffs are not high review effort because they touch production.
+- performance-risk: a plausible regression in latency, throughput, or resource use, not a deliberate resource-limit change.
+- secrets-exposure: a credential, key, or secret is added, logged, or made readable, or a secret scanner is loosened (allowlists, disabled rules). Scanner changes always need a human.
 
 Auto-accept ONLY if your confidence is at least 8/10, every change has a recognized safe signal, there are zero risk signals, and there are no P0 or P1 findings. If any of those conditions fail, do not accept. Still report every P2 and P3 finding you see: Radar's policy decides whether they block, so do not decline solely because of a P2 or P3 finding.
 
