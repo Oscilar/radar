@@ -87,11 +87,17 @@ func runReview(args []string) int {
 	expectedHead := flags.String("expected-head", "", "event head SHA; required in approval mode")
 	settle := flags.Duration("settle", 10*time.Second, "time between check observations")
 	apply := flags.Bool("apply", false, "allow an APPROVE review when policy mode is approve")
+	trustPath := flags.String("author-trust", "", "private login-to-tier roster; enables the shadow tier evaluation")
+	trustAuditPath := flags.String("author-trust-audit", "", "file for the private tier audit record; required with -author-trust")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
 	if *repo == "" || *prNumber <= 0 || *policyPath == "" || *settle < 0 {
 		fmt.Fprintln(os.Stderr, "radar-gh review: -repo, -pr, and -policy are required; -settle cannot be negative")
+		return 2
+	}
+	if (*trustPath == "") != (*trustAuditPath == "") {
+		fmt.Fprintln(os.Stderr, "radar-gh review: -author-trust and -author-trust-audit go together")
 		return 2
 	}
 
@@ -146,7 +152,18 @@ func runReview(args []string) int {
 		return 1
 	}
 
-	decision := reviewer.Review(second.Input)
+	var decision radar.PullRequestReview
+	if *trustPath == "" {
+		decision = reviewer.Review(second.Input)
+	} else {
+		var audit radar.AuthorTrustAudit
+		decision, audit = reviewWithAuthorTrust(reviewer, *repo, *prNumber, second.Input, *trustPath)
+		// Stderr and stdout are public; only the audit file names the tier.
+		if err := writeAuditFile(*trustAuditPath, audit); err != nil {
+			fmt.Fprintln(os.Stderr, "radar-gh review: writing author trust audit failed")
+			return 1
+		}
+	}
 	if decision.Action == radar.PullRequestApprove {
 		if second.ExistingApproval {
 			if err := writeJSON(os.Stdout, decision); err != nil {
@@ -176,6 +193,68 @@ func runReview(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// reviewWithAuthorTrust never lets a trust failure change or block the live
+// decision: it falls back to the plain review and records why in the audit.
+func reviewWithAuthorTrust(reviewer *radar.PullRequestReviewer, repo string, number int, in radar.PullRequestInput, rosterPath string) (radar.PullRequestReview, radar.AuthorTrustAudit) {
+	fail := func(reason string) (radar.PullRequestReview, radar.AuthorTrustAudit) {
+		live, audit := reviewer.ReviewWithAuthorTrust(in, radar.AuthorTrust{})
+		audit.Error = reason
+		return live, audit
+	}
+	data, err := os.ReadFile(rosterPath)
+	if err != nil {
+		return fail("roster unreadable")
+	}
+	roster, err := radar.ParseAuthorTrustRoster(data)
+	if err != nil {
+		return fail(err.Error())
+	}
+	messages, err := fetchCommitMessages(repo, number)
+	if err != nil {
+		return fail("commit messages unavailable")
+	}
+	trust := radar.AuthorTrust{AgentAuthored: radar.AgentAuthored(in.Body, messages)}
+	if strings.EqualFold(in.AuthorType, "User") {
+		trust.Tier = roster.Tier(in.Author)
+	}
+	return reviewer.ReviewWithAuthorTrust(in, trust)
+}
+
+// fetchCommitMessages returns every commit message; GitHub lists at most 250
+// commits per pull request, so a longer one is an error.
+func fetchCommitMessages(repo string, number int) ([]string, error) {
+	var pages [][]struct {
+		Commit struct {
+			Message string `json:"message"`
+		} `json:"commit"`
+	}
+	if err := ghJSON(&pages, "api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/pulls/%d/commits?per_page=100", repo, number)); err != nil {
+		return nil, err
+	}
+	var messages []string
+	for _, page := range pages {
+		for _, c := range page {
+			messages = append(messages, c.Commit.Message)
+		}
+	}
+	if len(messages) >= 250 {
+		return nil, errors.New("commit list may be truncated")
+	}
+	return messages, nil
+}
+
+func writeAuditFile(path string, audit radar.AuthorTrustAudit) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := writeJSON(f, audit); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 func loadPullRequestPolicy(path string) (radar.PullRequestPolicy, error) {

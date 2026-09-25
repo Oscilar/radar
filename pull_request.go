@@ -95,6 +95,9 @@ type PullRequestPolicy struct {
 	// an approval. Empty means P0, P1 and P2, the original criterion. It must
 	// always include P0 and P1.
 	BlockingFindingSeverities []string `json:"blocking_finding_severities,omitempty"`
+	// AuthorTrust bounds the shadow-only adjustment a private per-author tier
+	// may make. Nil disables tiers.
+	AuthorTrust *PullRequestAuthorTrust `json:"author_trust,omitempty"`
 }
 
 // PullRequestReview is a strict, machine-readable decision bound to one head.
@@ -214,11 +217,25 @@ func (p PullRequestPolicy) Validate() error {
 			return err
 		}
 	}
-	return nil
+	return p.validateAuthorTrust()
 }
 
 // Review evaluates current PR state. It never performs provider mutations.
 func (r *PullRequestReviewer) Review(in PullRequestInput) PullRequestReview {
+	out, _ := r.review(in)
+	return out
+}
+
+// reviewFacts are the policy-independent results a tiered evaluation reuses.
+type reviewFacts struct {
+	agentReviewed bool
+	denied        bool
+	riskPassed    bool
+	diff          Diff
+}
+
+func (r *PullRequestReviewer) review(in PullRequestInput) (PullRequestReview, reviewFacts) {
+	var facts reviewFacts
 	out := PullRequestReview{
 		SchemaVersion:  1,
 		RequestID:      in.ID,
@@ -235,16 +252,18 @@ func (r *PullRequestReviewer) Review(in PullRequestInput) PullRequestReview {
 	}
 
 	if ok, reason := reviewStateGate(r.policy, in); !add("pr.state", ok, reason) {
-		return out
+		return out, facts
 	}
 
 	diff, complete, reason := pullRequestDiff(in)
 	if !add("pr.complete-diff", complete, reason) {
-		return out
+		return out, facts
 	}
+	facts.diff = diff
 
 	denied, denyReason := pullRequestDenied(r.policy, in)
 	add("pr.deny-policy", !denied, denyReason)
+	facts.denied = denied
 
 	rule, allowReason := matchPullRequestRule(r.policy, in)
 	allowlisted := rule != nil
@@ -256,37 +275,46 @@ func (r *PullRequestReviewer) Review(in PullRequestInput) PullRequestReview {
 	out.RawRiskScore = r.scorer.Score(diff)
 	if math.IsNaN(out.RawRiskScore) || math.IsInf(out.RawRiskScore, 0) {
 		add("pr.risk-threshold", false, "risk scorer returned a non-finite value")
-		return out
+		return out, facts
 	}
 	out.RiskPercentile = r.calibrator.Percentile(out.RawRiskScore)
 	riskPassed := out.RiskPercentile <= r.policy.MaxRiskPercentile
 	add("pr.risk-threshold", riskPassed,
 		fmt.Sprintf("risk percentile %.1f vs threshold P%.1f", out.RiskPercentile, r.policy.MaxRiskPercentile))
+	facts.riskPassed = riskPassed
 
 	out.Agent = r.agent.Review(diff)
+	facts.agentReviewed = true
 	blocking := r.policy.blockingSeverities()
 	claimed := out.Agent.Accept || out.Agent.ModelAccept
-	agentPassed := claimed && out.Agent.Confidence >= r.policy.MinReviewConfidence &&
-		len(out.Agent.RiskSignals) == 0 && len(out.Agent.SafeSignals) > 0 &&
-		reviewCoversDiff(out.Agent, diff) && !hasBlockingFinding(out.Agent.Findings, blocking)
+	agentPassed := agentPasses(r.policy, out.Agent, diff, true)
 	add("pr.review-agent", agentPassed,
 		fmt.Sprintf("accept=%t confidence=%d/%d risk-signals=%d reviewed-files=%d/%d blocking-findings(%s)=%t: %s",
 			claimed, out.Agent.Confidence, r.policy.MinReviewConfidence, len(out.Agent.RiskSignals),
 			len(out.Agent.ReviewedFiles), len(diff.Changes), strings.Join(blocking, ","), hasBlockingFinding(out.Agent.Findings, blocking), out.Agent.Summary))
 
 	out.Eligible = !denied && allowlisted && riskPassed
-	if out.Eligible && agentPassed {
-		if r.policy.Mode == PullRequestModeApprove {
-			out.Action = PullRequestApprove
-		} else {
-			out.Action = PullRequestWouldApprove
-		}
-		return out
+	out.Action = decideAction(r.policy.Mode, denied, out.Eligible, agentPassed)
+	return out, facts
+}
+
+func agentPasses(policy PullRequestPolicy, result ACRResult, diff Diff, claimRequired bool) bool {
+	claimed := result.Accept || result.ModelAccept
+	return (claimed || !claimRequired) && result.Confidence >= policy.MinReviewConfidence &&
+		len(result.RiskSignals) == 0 && len(result.SafeSignals) > 0 &&
+		reviewCoversDiff(result, diff) && !hasBlockingFinding(result.Findings, policy.blockingSeverities())
+}
+
+func decideAction(mode PullRequestMode, denied, eligible, agentPassed bool) PullRequestAction {
+	switch {
+	case eligible && agentPassed && mode == PullRequestModeApprove:
+		return PullRequestApprove
+	case eligible && agentPassed:
+		return PullRequestWouldApprove
+	case !denied && !eligible && agentPassed:
+		return PullRequestPolicyCandidate
 	}
-	if !denied && !out.Eligible && agentPassed {
-		out.Action = PullRequestPolicyCandidate
-	}
-	return out
+	return PullRequestRouteToHuman
 }
 
 func reviewCoversDiff(result ACRResult, diff Diff) bool {

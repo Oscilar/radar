@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -126,5 +127,19 @@ func TestNewReviewAgentFireworks(t *testing.T) {
 	}
 	if _, err := newReviewAgent("bogus"); err == nil {
 		t.Fatal("unknown agent must error")
+	}
+}
+
+func TestWriteAuditFileIsPrivate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.json")
+	if err := writeAuditFile(path, radar.AuthorTrustAudit{Tier: 2}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("audit mode = %v, want 0600", info.Mode().Perm())
 	}
 }
