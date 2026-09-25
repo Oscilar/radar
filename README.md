@@ -223,6 +223,47 @@ read access to repository contents, checks, pull requests, and review threads.
 Approval mode additionally needs branch-protection read access and pull-request
 review write access.
 
+### Private author trust tiers (shadow only)
+
+A policy may carry an `author_trust` block that lets a hand-assigned, private
+per-author tier relax approval by a bounded amount:
+
+```json
+"author_trust": {
+  "tiers": [
+    {"tier": 2, "min_review_confidence": 7},
+    {"tier": 3, "min_review_confidence": 7,
+     "rule_limits": [{"rule": "small-change", "max_files": 15, "max_changed_lines": 300}]}
+  ]
+}
+```
+
+A tier may lower `min_review_confidence` by at most one point and raise the limits
+of named, already-bounded allow rules up to double and never past the global
+limits. A higher tier must be at least as permissive as a lower one, and an
+unconfigured tier inherits the nearest configured tier below it. Tiers never touch
+the state gate, deny paths and phrases, the risk threshold, blocking finding
+severities, or the zero-risk-signal requirement (so `structural-change` still
+routes to a human).
+
+The roster is a flat YAML mapping of GitHub login to tier 0-3 (unlisted means 0),
+passed with `-author-trust`. Only `User` authors get a tier. When the PR body or
+any commit carries a coding-agent trailer or session link, the author's tier drops
+by one. Below the live confidence minimum the model is told not to accept, so the
+tiered gate does not require its accept claim there; everything else it does.
+
+Tiers are **shadow only**: the decision on stdout, and anything Radar posts, is
+exactly what it would be without a roster, and never names a tier. The tiered
+outcome goes to the file named by `-author-trust-audit` (mode 0600), which the
+caller must keep away from anyone who is not a tier owner. A roster that fails to
+load is recorded in the audit and leaves the live decision unaffected.
+
+`radar-gh trust-replay -policy P -author-trust R -records R.jsonl` re-decides
+stored reviews (`{input, review, commit_messages, outcome}` per line) with and
+without tiers from their recorded verdicts, without model calls, and reports the
+bad-outcome rate of tier-only approvals next to the live approvals and the
+background.
+
 ## Scope / non-goals
 
 - This reproduces RADAR's **decision logic and metric definitions**, not Meta's
