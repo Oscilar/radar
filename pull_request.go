@@ -132,6 +132,8 @@ type PullRequestPolicy struct {
 	AllowStacked bool `json:"allow_stacked,omitempty"`
 	// GeneratedFiles withholds generated files from the review agents.
 	GeneratedFiles *PullRequestGeneratedFiles `json:"generated_files,omitempty"`
+	// Lockfiles reviews lockfiles instead of withholding them.
+	Lockfiles *PullRequestLockfiles `json:"lockfiles,omitempty"`
 	// ReviewChunkChars caps the patch text sent in one review request; larger
 	// diffs are reviewed in several. Zero means defaultReviewChunkChars.
 	ReviewChunkChars int `json:"review_chunk_chars,omitempty"`
@@ -160,6 +162,8 @@ type PullRequestReview struct {
 	Stack         []PullRequestStackEntry      `json:"stack,omitempty"`
 	// Withheld are the generated files the agents saw only by name.
 	Withheld []GeneratedFile `json:"withheld,omitempty"`
+	// Lockfiles summarises each changed lockfile the agents reviewed.
+	Lockfiles []LockfileSummary `json:"lockfiles,omitempty"`
 	// GeneratedUnlisted are reviewed files whose generated-code header the
 	// change itself adds, outside every configured generated path.
 	GeneratedUnlisted []string      `json:"generated_unlisted,omitempty"`
@@ -374,6 +378,14 @@ func (r *PullRequestReviewer) Review(in PullRequestInput) PullRequestReview {
 	denied, denyReason := pullRequestDenied(r.policy, in)
 	add("pr.deny-policy", !denied, denyReason)
 
+	lockfiles := r.lockfileSummaries(in)
+	out.Lockfiles = lockfiles
+	if r.policy.Lockfiles != nil && len(lockfiles) > 0 {
+		backstop, reason := lockfileBackstop(*r.policy.Lockfiles, in.Files, lockfiles)
+		add("pr.lockfile-policy", !backstop, reason)
+		denied = denied || backstop
+	}
+
 	allowlisted := true
 	if r.policy.basis() == ApprovalBasisAllowRules {
 		rule, allowReason := matchPullRequestRule(r.policy, in)
@@ -401,7 +413,7 @@ func (r *PullRequestReviewer) Review(in PullRequestInput) PullRequestReview {
 		add("pr.risk-score", true, fmt.Sprintf("risk percentile %.1f recorded, not gating under review-findings", out.RiskPercentile))
 	}
 
-	reviewDiff := r.reviewableDiff(diff, in)
+	reviewDiff := r.reviewableDiff(diff, in, lockfiles)
 	out.Withheld = reviewDiff.Withheld
 	for _, f := range in.Files {
 		if _, unlisted := r.generated.classify(f); unlisted {
@@ -430,18 +442,61 @@ func (r *PullRequestReviewer) Review(in PullRequestInput) PullRequestReview {
 	return out
 }
 
-// reviewableDiff withholds generated files from what the agents see.
-func (r *PullRequestReviewer) reviewableDiff(diff Diff, in PullRequestInput) Diff {
+func (r *PullRequestReviewer) lockfileSummaries(in PullRequestInput) []LockfileSummary {
+	if r.policy.Lockfiles == nil {
+		return nil
+	}
+	var out []LockfileSummary
+	for _, f := range in.Files {
+		if kind, ok := lockfileKindOf(f.Path); ok {
+			out = append(out, summarizeLockfile(f.Path, kind, f.Patch))
+		}
+	}
+	return out
+}
+
+// reviewableDiff withholds generated files from what the agents see. With
+// lockfile review on, lockfiles are kept: one whose +/- lines repeat an
+// earlier lockfile's is shown as a pointer to it, and one too large for a
+// single request is split by hunk so every line is still reviewed.
+func (r *PullRequestReviewer) reviewableDiff(diff Diff, in PullRequestInput, lockfiles []LockfileSummary) Diff {
 	out := diff
 	out.Changes = nil
+	out.Lockfiles = lockfiles
+	summaries := map[string]LockfileSummary{}
+	for _, s := range lockfiles {
+		summaries[s.Path] = s
+	}
+	firstWith := map[string]string{}
+	budget := r.policy.reviewChunkChars() - chunkOverheadChars - 512
 	for i, f := range in.Files {
+		change := diff.Changes[i]
+		if summary, isLock := summaries[f.Path]; isLock {
+			key := changeLinesKey(change, summary)
+			if first, seen := firstWith[key]; seen {
+				change.Content = "(identical +/- lines and summary to " + first + "; context omitted)"
+				out.Changes = append(out.Changes, change)
+				continue
+			}
+			firstWith[key] = f.Path
+			pieces := splitLockfilePatch(change.Content, budget)
+			for j, piece := range pieces {
+				part := change
+				part.Content = piece
+				if len(pieces) > 1 {
+					part.Content = fmt.Sprintf("(lockfile patch piece %d of %d)\n%s", j+1, len(pieces), piece)
+				}
+				out.Changes = append(out.Changes, part)
+			}
+			continue
+		}
 		if reason, _ := r.generated.classify(f); reason != "" {
 			out.Withheld = append(out.Withheld, GeneratedFile{
 				Path: f.Path, Status: f.Status, Additions: f.Additions, Deletions: f.Deletions, Reason: reason,
 			})
 			continue
 		}
-		out.Changes = append(out.Changes, diff.Changes[i])
+		out.Changes = append(out.Changes, change)
 	}
 	if len(out.Withheld) > 0 && r.policy.GeneratedFiles != nil && r.policy.GeneratedFiles.Note != "" {
 		out.ReviewNotes = append(out.ReviewNotes, r.policy.GeneratedFiles.Note)
@@ -534,24 +589,21 @@ func (r *PullRequestReviewer) describeReviewers() string {
 	return strings.Join(names, "+")
 }
 
+// reviewCoversDiff requires the agent to name exactly the files it was
+// shown; a file split into several pieces counts once.
 func reviewCoversDiff(result ACRResult, diff Diff) bool {
-	want := map[string]int{}
+	want := map[string]bool{}
 	for _, change := range diff.Changes {
-		want[change.File]++
+		want[change.File] = true
 	}
-	got := map[string]int{}
+	got := map[string]bool{}
 	for _, file := range result.ReviewedFiles {
-		got[file]++
-	}
-	if len(want) != len(got) {
-		return false
-	}
-	for file, count := range want {
-		if got[file] != count {
+		if !want[file] {
 			return false
 		}
+		got[file] = true
 	}
-	return true
+	return len(got) == len(want)
 }
 
 // blockingSeverities returns the finding severities that block approval,

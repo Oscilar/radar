@@ -77,6 +77,8 @@ Auto-accept ONLY if your confidence is at least 8/10, every change has a recogni
 
 Every concrete concern that would make you decline, other than the change's size or structural scope, must also appear in findings with a severity: a policy may decide from the findings alone. Confidence is how sure you are of your assessment and that your findings are complete.
 
+Lockfiles are reviewed like code. A lockfile summary parsed from the patches may precede them; verify it against the patches. Report each of these supply-chain signals as a P1 finding: a package name that imitates a well-known one (typosquat), a new or changed registry, index, git or URL source, a version downgrade, an integrity hash that changes without a version change, a lockfile that changes without a matching manifest change, and a new dependency the manifest changes shown do not explain.
+
 Generated files may be listed by name without a patch. You cannot review their content; flag a problem only if their presence or size is itself suspicious next to the patches shown.
 
 Respond with ONLY a JSON object, no prose, of the form:
@@ -187,6 +189,9 @@ func renderDiffForReview(d Diff) string {
 	}
 	for _, note := range d.ReviewNotes {
 		fmt.Fprintf(&b, "Note: %s\n\n", note)
+	}
+	if len(d.Lockfiles) > 0 {
+		b.WriteString(renderLockfileSummaries(d.Lockfiles))
 	}
 	for i, c := range d.Changes {
 		fmt.Fprintf(&b, "--- change %d: %s (complexity %d) ---\n%s\n\n", i+1, c.File, c.Complexity, c.Content)

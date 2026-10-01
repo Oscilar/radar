@@ -170,6 +170,8 @@ type Diff struct {
 	// Withheld are changed files left out of Changes because they are
 	// generated. Review agents see their names and line counts only.
 	Withheld []GeneratedFile `json:"withheld,omitempty"`
+	// Lockfiles summarises each changed lockfile in Changes.
+	Lockfiles []LockfileSummary `json:"lockfiles,omitempty"`
 	// ReviewNotes is policy context for the review agent.
 	ReviewNotes []string `json:"review_notes,omitempty"`
 	// Part and Parts number this diff when a large change is reviewed in

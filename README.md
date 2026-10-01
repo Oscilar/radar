@@ -247,6 +247,25 @@ whose every file is withheld routes to a human. `generated_files.note` is passed
 to the agents, for example to say which CI checks verify generated output. The
 decision lists what was withheld in `withheld`.
 
+#### Lockfiles
+
+With a `lockfiles` block, recognised lockfiles (`gradle.lockfile`,
+`poetry.lock`, `uv.lock`, `go.sum`, `package-lock.json`) are never withheld as
+generated. Each agent gets a summary parsed from the patches (per package: old
+and new version, added or removed, and changes to where it is resolved from or
+to an integrity hash without a version change) followed by the raw lines. A
+lockfile whose +/- lines and summary repeat an earlier one's, as when one bump
+regenerates many Gradle lockfiles, is shown as a pointer to the first; one too
+large for a request is split by hunk across parts instead of failing. The
+prompt makes supply-chain signals P1 findings: typosquats, new or changed
+sources, downgrades, hash-only changes, and lockfile changes without a matching
+manifest change. Two deterministic backstops route to a human:
+`require_human_without_manifest` (no `pyproject.toml`, `go.mod` or
+`package.json` change beside the lockfile; for Gradle, no build script, version
+catalog or `gradle.properties` change anywhere) and
+`require_human_on_source_change` (any registry, index, git or URL source
+change). The decision records the summaries in `lockfiles`.
+
 #### Stacked pull requests
 
 With `allow_stacked`, a pull request whose base is another open
