@@ -55,6 +55,7 @@ func largeFeatureInput(files int) PullRequestInput {
 
 func structuralVerdict() ACRResult {
 	return ACRResult{
+		ModelAccept: true,
 		Confidence:  9,
 		RiskSignals: []ChangeSignal{SignalStructuralChange, SignalHighReviewEffort},
 		Findings:    []ReviewFinding{{Severity: "P2", Title: "naming", Summary: "consider renaming"}},
@@ -335,26 +336,39 @@ func TestNewFileAtGeneratedPathIsReviewed(t *testing.T) {
 	}
 }
 
-func TestReviewFindingsUnexplainedDeclineBlocks(t *testing.T) {
-	declined := ACRResult{Confidence: 9, Summary: "something feels off"}
-	reviewer, err := NewPullRequestReviewer(findingsPolicy(PullRequestModeShadow), fixedScorer(0), &recordingAgent{result: declined})
-	if err != nil {
-		t.Fatal(err)
+// An explicit decline blocks approval under review-findings regardless of
+// findings, signals or confidence (TJ, INF-1220): Codex declined 7 replayed
+// PRs as needing a human while raising only structural or effort signals.
+func TestReviewFindingsDeclineAlwaysBlocks(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		verdict ACRResult
+	}{
+		{"bare decline", ACRResult{Confidence: 10, Summary: "a human should look"}},
+		{"decline with only P3 findings", ACRResult{Confidence: 10, Findings: []ReviewFinding{{Severity: "P3", Title: "nit", Summary: "s"}}, Summary: "s"}},
+		{"decline with only P2 findings", ACRResult{Confidence: 10, Findings: []ReviewFinding{{Severity: "P2", Title: "naming", Summary: "s"}}, Summary: "s"}},
+		{"decline with structural signals", ACRResult{Confidence: 10, RiskSignals: []ChangeSignal{SignalStructuralChange, SignalHighReviewEffort}, Summary: "requires human review"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			policy := findingsPolicy(PullRequestModeShadow)
+			policy.RequiredReviewers = 2
+			reviewer, err := NewPullRequestReviewer(policy, fixedScorer(0),
+				namedAgent{&recordingAgent{result: structuralVerdict()}, "fireworks/glm"},
+				namedAgent{&recordingAgent{result: tt.verdict}, "bedrock-openai/codex"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := reviewer.Review(largeFeatureInput(1))
+			if got.Action != PullRequestRouteToHuman || !strings.Contains(got.Reviews[1].Reason, "declined=true") {
+				t.Fatalf("a declining reviewer must block approval, got %s; %s", got.Action, got.Reviews[1].Reason)
+			}
+		})
 	}
-	if got := reviewer.Review(largeFeatureInput(1)); got.Action != PullRequestRouteToHuman {
-		t.Fatalf("a decline with no finding or signal must route to human, got %s", got.Action)
-	}
-	declined.Findings = []ReviewFinding{{Severity: "P2", Title: "naming", Summary: "unclear name"}}
-	reviewer, err = NewPullRequestReviewer(findingsPolicy(PullRequestModeShadow), fixedScorer(0), &recordingAgent{result: declined})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := reviewer.Review(largeFeatureInput(1)); got.Action != PullRequestWouldApprove {
-		t.Fatalf("a decline explained by a non-blocking finding must pass, got %s", got.Action)
-	}
-	declined.Findings = nil
-	declined.ModelAccept = true
-	reviewer, err = NewPullRequestReviewer(findingsPolicy(PullRequestModeShadow), fixedScorer(0), &recordingAgent{result: declined})
+}
+
+func TestReviewFindingsAcceptingReviewPasses(t *testing.T) {
+	accepted := ACRResult{ModelAccept: true, Confidence: 9, Summary: "fine"}
+	reviewer, err := NewPullRequestReviewer(findingsPolicy(PullRequestModeShadow), fixedScorer(0), &recordingAgent{result: accepted})
 	if err != nil {
 		t.Fatal(err)
 	}

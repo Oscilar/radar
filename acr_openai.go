@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,6 +28,19 @@ type OpenAIAgent struct {
 	// Review additionally enforces a reviewTimeout deadline per call, so a
 	// caller-supplied client without a Timeout cannot block the funnel forever.
 	HTTP *http.Client
+	// Timeout bounds one review; zero means reviewTimeout.
+	Timeout time.Duration
+	// ReasoningEffort, when set, is sent as reasoning.effort.
+	ReasoningEffort string
+	// MaxOutputTokens, when positive, caps the response; a response cut off
+	// there is reported as truncated.
+	MaxOutputTokens int
+	// ExplicitCache sends prompt_cache_options {mode: explicit} with no
+	// breakpoint. Radar's prefix is too short to be read back, so the default
+	// implicit mode only bills cache writes, at 1.25x input, on every review.
+	ExplicitCache bool
+	// Provider prefixes Describe; empty means "openai".
+	Provider string
 }
 
 // NewOpenAIAgent constructs an OpenAIAgent from the environment
@@ -49,11 +63,22 @@ func NewOpenAIAgent() (*OpenAIAgent, error) {
 }
 
 type openAIResponsesReq struct {
-	Model        string           `json:"model"`
-	Instructions string           `json:"instructions"`
-	Input        string           `json:"input"`
-	Store        bool             `json:"store"`
-	Text         openAITextConfig `json:"text"`
+	Model              string              `json:"model"`
+	Instructions       string              `json:"instructions"`
+	Input              string              `json:"input"`
+	Store              bool                `json:"store"`
+	Text               openAITextConfig    `json:"text"`
+	Reasoning          *openAIReasoning    `json:"reasoning,omitempty"`
+	MaxOutputTokens    int                 `json:"max_output_tokens,omitempty"`
+	PromptCacheOptions *openAICacheOptions `json:"prompt_cache_options,omitempty"`
+}
+
+type openAIReasoning struct {
+	Effort string `json:"effort"`
+}
+
+type openAICacheOptions struct {
+	Mode string `json:"mode"`
 }
 
 type openAITextConfig struct {
@@ -68,7 +93,15 @@ type openAITextFormat struct {
 }
 
 type openAIResponsesResp struct {
-	Status            string `json:"status"`
+	Status string `json:"status"`
+	Usage  *struct {
+		InputTokens        int64 `json:"input_tokens"`
+		OutputTokens       int64 `json:"output_tokens"`
+		InputTokensDetails struct {
+			CachedTokens     int64 `json:"cached_tokens"`
+			CacheWriteTokens int64 `json:"cache_write_tokens"`
+		} `json:"input_tokens_details"`
+	} `json:"usage"`
 	IncompleteDetails *struct {
 		Reason string `json:"reason"`
 	} `json:"incomplete_details"`
@@ -161,14 +194,23 @@ func acrVerdictSchema() map[string]any {
 // Review sends the diff to the OpenAI model and returns the parsed verdict,
 // failing safe (non-accept) on any error.
 func (a *OpenAIAgent) Review(d Diff) ACRResult {
-	ctx, cancel := context.WithTimeout(context.Background(), reviewTimeout)
+	timeout := a.Timeout
+	if timeout <= 0 {
+		timeout = reviewTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	start := time.Now()
 	res, err := a.review(ctx, d)
 	if err != nil {
-		return ACRResult{Accept: false, Confidence: 0, Summary: "ACR OpenAI error, failing safe: " + err.Error()}
+		res = ACRResult{Accept: false, Confidence: 0, Summary: "ACR OpenAI error, failing safe: " + err.Error(), Usage: res.Usage, Truncated: errors.Is(err, errOpenAITruncated)}
 	}
+	elapsed := time.Since(start).Milliseconds()
+	res.ElapsedMS = &elapsed
 	return res
 }
+
+var errOpenAITruncated = errors.New("openai response truncated at max_output_tokens")
 
 func (a *OpenAIAgent) review(ctx context.Context, d Diff) (ACRResult, error) {
 	client := a.HTTP
@@ -193,6 +235,13 @@ func (a *OpenAIAgent) review(ctx context.Context, d Diff) (ACRResult, error) {
 				Schema: acrVerdictSchema(),
 			},
 		},
+		MaxOutputTokens: a.MaxOutputTokens,
+	}
+	if a.ReasoningEffort != "" {
+		reqBody.Reasoning = &openAIReasoning{Effort: a.ReasoningEffort}
+	}
+	if a.ExplicitCache {
+		reqBody.PromptCacheOptions = &openAICacheOptions{Mode: "explicit"}
 	}
 	buf, err := json.Marshal(reqBody)
 	if err != nil {
@@ -226,12 +275,26 @@ func (a *OpenAIAgent) review(ctx context.Context, d Diff) (ACRResult, error) {
 	if or.Error != nil {
 		return ACRResult{}, fmt.Errorf("openai API error: %s", or.Error.Message)
 	}
+	var usage *ReviewUsage
+	if or.Usage != nil {
+		usage = &ReviewUsage{
+			InputTokens: or.Usage.InputTokens, OutputTokens: or.Usage.OutputTokens,
+			CacheReadTokens: or.Usage.InputTokensDetails.CachedTokens, CacheWriteTokens: or.Usage.InputTokensDetails.CacheWriteTokens,
+			Requests: 1,
+		}
+	}
 	if or.Status != "completed" {
 		reason := ""
 		if or.IncompleteDetails != nil {
-			reason = ": " + or.IncompleteDetails.Reason
+			reason = or.IncompleteDetails.Reason
 		}
-		return ACRResult{}, fmt.Errorf("openai response status %q%s", or.Status, reason)
+		if reason == "max_output_tokens" {
+			return ACRResult{Usage: usage}, errOpenAITruncated
+		}
+		if reason != "" {
+			reason = ": " + reason
+		}
+		return ACRResult{Usage: usage}, fmt.Errorf("openai response status %q%s", or.Status, reason)
 	}
 
 	var text strings.Builder
@@ -255,7 +318,9 @@ func (a *OpenAIAgent) review(ctx context.Context, d Diff) (ACRResult, error) {
 		}
 		return ACRResult{}, fmt.Errorf("openai API returned no output text")
 	}
-	return parseACRVerdict(text.String())
+	res, err := parseACRVerdict(text.String())
+	res.Usage = usage
+	return res, err
 }
 
 // ConcurrentReviewSafe reports that each Review builds its own request and
@@ -263,4 +328,10 @@ func (a *OpenAIAgent) review(ctx context.Context, d Diff) (ACRResult, error) {
 func (a *OpenAIAgent) ConcurrentReviewSafe() bool { return true }
 
 // Describe names the provider and model for decision provenance.
-func (a *OpenAIAgent) Describe() string { return "openai/" + a.Model }
+func (a *OpenAIAgent) Describe() string {
+	provider := a.Provider
+	if provider == "" {
+		provider = "openai"
+	}
+	return provider + "/" + a.Model
+}

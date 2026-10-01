@@ -124,7 +124,7 @@ func TestOpenAIAgentFailsSafeOnResponsesErrors(t *testing.T) {
 			name:       "incomplete response",
 			statusCode: http.StatusOK,
 			body:       `{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}`,
-			want:       `status "incomplete": max_output_tokens`,
+			want:       `truncated at max_output_tokens`,
 		},
 		{
 			name:       "refusal",
@@ -190,5 +190,42 @@ func TestParseACRVerdictKeepsP2BlockingByDefault(t *testing.T) {
 	}
 	if res.Accept || !res.ModelAccept {
 		t.Fatalf("P2 must still block Accept while ModelAccept keeps the claim: %+v", res)
+	}
+}
+
+func TestOpenAIAgentReportsUsageTruncationAndRequestOptions(t *testing.T) {
+	var got map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		_, _ = w.Write([]byte(`{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":900,"output_tokens":32000,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}},"output":[]}`))
+	}))
+	defer server.Close()
+	agent := &OpenAIAgent{APIKey: "k", Model: "openai.gpt-5.6-terra", BaseURL: server.URL, HTTP: server.Client(),
+		ReasoningEffort: "high", MaxOutputTokens: 32000, ExplicitCache: true, Provider: "bedrock-openai"}
+	res := agent.Review(Diff{Changes: []Change{{File: "a", Content: "+x"}}})
+	if !res.Truncated || res.Usage == nil || res.Usage.OutputTokens != 32000 || res.ElapsedMS == nil {
+		t.Fatalf("got %+v usage=%+v", res, res.Usage)
+	}
+	if got["reasoning"].(map[string]any)["effort"] != "high" || got["max_output_tokens"].(float64) != 32000 ||
+		got["prompt_cache_options"].(map[string]any)["mode"] != "explicit" {
+		t.Fatalf("request = %v", got)
+	}
+	if agent.Describe() != "bedrock-openai/openai.gpt-5.6-terra" {
+		t.Fatalf("describe = %q", agent.Describe())
+	}
+	plain := &OpenAIAgent{Model: "gpt-x"}
+	if plain.Describe() != "openai/gpt-x" {
+		t.Fatalf("default provider: %q", plain.Describe())
+	}
+}
+
+func TestOpenAIAgentRecordsUsageOnSuccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"completed","usage":{"input_tokens":1134,"output_tokens":191,"input_tokens_details":{"cached_tokens":7,"cache_write_tokens":3}},"output":[{"type":"message","content":[{"type":"output_text","text":"{\"accept\":true,\"confidence\":9,\"risk_signals\":[],\"safe_signals\":[\"doc-comment-update\"],\"reviewed_files\":[\"a\"],\"findings\":[],\"summary\":\"s\"}"}]}]}`))
+	}))
+	defer server.Close()
+	res := (&OpenAIAgent{APIKey: "k", Model: "m", BaseURL: server.URL, HTTP: server.Client()}).Review(Diff{Changes: []Change{{File: "a"}}})
+	if res.Usage == nil || res.Usage.InputTokens != 1134 || res.Usage.OutputTokens != 191 || res.Usage.CacheReadTokens != 7 || res.Usage.CacheWriteTokens != 3 || res.Usage.Requests != 1 {
+		t.Fatalf("usage = %+v (summary %q)", res.Usage, res.Summary)
 	}
 }
