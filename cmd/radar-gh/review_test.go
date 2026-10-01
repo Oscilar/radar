@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"net/url"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -236,5 +238,50 @@ func TestExampleReviewFindingsPolicyLoads(t *testing.T) {
 	}
 	if policy.ApprovalBasis != radar.ApprovalBasisReviewFindings || policy.Mode != radar.PullRequestModeShadow {
 		t.Fatalf("policy = %+v", policy)
+	}
+}
+
+func TestSnapshotsStableIncludesTheStack(t *testing.T) {
+	base := radar.PullRequestInput{HeadSHA: "h", CheckFingerprint: "c", BaseRef: "ram/a",
+		Stack: []radar.PullRequestStackEntry{{Number: 1, HeadRef: "ram/a", HeadSHA: "p1", BaseRef: "main"}}}
+	if !snapshotsStable(base, base) {
+		t.Fatal("identical snapshots are stable")
+	}
+	moved := base
+	moved.Stack = []radar.PullRequestStackEntry{{Number: 1, HeadRef: "ram/a", HeadSHA: "p2", BaseRef: "main"}}
+	if snapshotsStable(base, moved) {
+		t.Fatal("a parent force-push between observations must not count as stable")
+	}
+	dropped := base
+	dropped.Stack = nil
+	if snapshotsStable(base, dropped) {
+		t.Fatal("a stack that disappears between observations must not count as stable")
+	}
+	retargeted := base
+	retargeted.BaseRef = "main"
+	if snapshotsStable(base, retargeted) {
+		t.Fatal("a retarget between observations must not count as stable")
+	}
+}
+
+func TestCheckoutFileResolvesFromThePolicyCheckout(t *testing.T) {
+	repo := t.TempDir()
+	if out, err := exec.Command("git", "init", "-q", repo).CombinedOutput(); err != nil {
+		t.Skipf("git unavailable: %v %s", err, out)
+	}
+	if err := os.MkdirAll(filepath.Join(repo, ".github"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(t.TempDir()) // a working directory outside the checkout
+	got, err := checkoutFile(filepath.Join(repo, ".github", "radar-policy.json"), ".gitattributes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := filepath.EvalSymlinks(repo)
+	if gotDir, _ := filepath.EvalSymlinks(filepath.Dir(got)); gotDir != want || filepath.Base(got) != ".gitattributes" {
+		t.Fatalf("got %s, want %s/.gitattributes", got, want)
+	}
+	if _, err := checkoutFile(filepath.Join(t.TempDir(), "policy.json"), ".gitattributes"); err == nil {
+		t.Fatal("a policy outside any checkout must be an error, not the working directory's file")
 	}
 }

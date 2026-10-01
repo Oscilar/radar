@@ -106,6 +106,10 @@ func NewFireworksAgentForModel(model string) (*FireworksAgent, error) {
 	}, nil
 }
 
+// ConcurrentReviewSafe reports that each Review builds its own request and
+// shares only the http.Client, which is safe for concurrent use.
+func (a *FireworksAgent) ConcurrentReviewSafe() bool { return true }
+
 // Describe names the provider and model for decision provenance.
 func (a *FireworksAgent) Describe() string { return "fireworks/" + a.Model }
 

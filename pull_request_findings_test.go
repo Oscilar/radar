@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func findingsPolicy(mode PullRequestMode) PullRequestPolicy {
@@ -701,5 +703,112 @@ func TestReviewerMinConfidenceValidation(t *testing.T) {
 	allow.ReviewerMinConfidence = map[string]int{"bedrock/sonnet": 10}
 	if err := allow.Validate(); err == nil {
 		t.Fatal("reviewer floors are review-findings only")
+	}
+}
+
+func TestCopiedGeneratedFileIsReviewed(t *testing.T) {
+	reviewer, err := NewPullRequestReviewer(generatedPolicy(), fixedScorer(0), &recordingAgent{result: structuralVerdict()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := largeFeatureInput(1)
+	in.Files = append(in.Files, PullRequestFile{
+		Path: "ui/copy.snap", PreviousPath: "ui/a.snap", Status: "copied", Additions: 1,
+		Patch: "@@ -1 +1 @@\n+x", ContentComplete: true,
+	}, PullRequestFile{
+		Path: "ui/moved.snap", PreviousPath: "ui/b.snap", Status: "renamed", Additions: 1,
+		Patch: "@@ -1 +1 @@\n+y", ContentComplete: true,
+	})
+	got := reviewer.Review(in)
+	if len(got.Withheld) != 1 || got.Withheld[0].Path != "ui/moved.snap" {
+		t.Fatalf("a copy creates a file and must be reviewed; a rename within generated paths is withheld: %+v", got.Withheld)
+	}
+}
+
+func TestPathGlobCharacterClasses(t *testing.T) {
+	for _, tc := range []struct {
+		pattern, path string
+		want          bool
+	}{
+		{"generated/[0-9]*.go", "generated/1_types.go", true},
+		{"generated/[0-9]*.go", "generated/types.go", false},
+		{"generated/[0-9]*.go", "generated/[0-9]x.go", false},
+		{"v[!0-9].txt", "va.txt", true},
+		{"v[!0-9].txt", "v1.txt", false},
+		{"v[!0-9].txt", "v/.txt", false},
+		{"a[/b]c", "a/c", false},
+		{"a[/b]c", "abc", true},
+		{"x[]y]z", "x]z", true},
+		{"lit[eral", "lit[eral", true},
+	} {
+		if got := matchesAnyPath(tc.path, []string{tc.pattern}); got != tc.want {
+			t.Errorf("matchesAnyPath(%q, %q) = %t, want %t", tc.path, tc.pattern, got, tc.want)
+		}
+	}
+	if _, err := compilePathGlob("a[/]b"); err == nil {
+		t.Error("a class that can only match / matches nothing and must be rejected")
+	}
+	rules, err := ParseGitattributesGenerated([]byte("generated/[0-9]*.go linguist-generated\n"))
+	if err != nil || len(rules) != 1 {
+		t.Fatalf("rules=%v err=%v", rules, err)
+	}
+	m := newGeneratedMatcher(PullRequestGeneratedFiles{}, rules)
+	if reason, _ := m.classify(PullRequestFile{Path: "generated/2_api.go", Status: "modified"}); reason != "path" {
+		t.Fatal(".gitattributes character classes must match as git does")
+	}
+}
+
+// overlapAgent records the most Review calls in flight at once.
+type overlapAgent struct {
+	recordingAgent
+	safe              bool
+	inFlight, maxSeen atomic.Int32
+}
+
+func (a *overlapAgent) Review(d Diff) ACRResult {
+	n := a.inFlight.Add(1)
+	defer a.inFlight.Add(-1)
+	for {
+		seen := a.maxSeen.Load()
+		if n <= seen || a.maxSeen.CompareAndSwap(seen, n) {
+			break
+		}
+	}
+	time.Sleep(5 * time.Millisecond)
+	return a.recordingAgent.Review(d)
+}
+
+type concurrentOverlapAgent struct{ *overlapAgent }
+
+func (concurrentOverlapAgent) ConcurrentReviewSafe() bool { return true }
+
+func TestChunksRunSeriallyUnlessTheAgentIsConcurrencySafe(t *testing.T) {
+	policy := findingsPolicy(PullRequestModeShadow)
+	policy.ReviewChunkChars = 1000
+	plain := &overlapAgent{recordingAgent: recordingAgent{result: structuralVerdict()}}
+	reviewer, err := NewPullRequestReviewer(policy, fixedScorer(0), plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewer.Review(largeFeatureInput(6))
+	if got := plain.maxSeen.Load(); got != 1 {
+		t.Fatalf("an agent that does not declare concurrency safety saw %d concurrent calls", got)
+	}
+	safe := concurrentOverlapAgent{&overlapAgent{recordingAgent: recordingAgent{result: structuralVerdict()}}}
+	reviewer, err = NewPullRequestReviewer(policy, fixedScorer(0), safe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewer.Review(largeFeatureInput(6))
+	if got := safe.maxSeen.Load(); got < 2 || got > maxConcurrentChunks {
+		t.Fatalf("a concurrency-safe agent saw %d concurrent calls, want 2..%d", got, maxConcurrentChunks)
+	}
+}
+
+func TestBuiltInAgentsDeclareConcurrencySafety(t *testing.T) {
+	for _, agent := range []ReviewAgent{RuleBasedAgent{}, &OpenAIAgent{}, &LLMAgent{}, &FireworksAgent{}} {
+		if !concurrentReviewSafe(agent) {
+			t.Errorf("%T should declare ConcurrentReviewSafe", agent)
+		}
 	}
 }

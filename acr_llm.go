@@ -277,5 +277,9 @@ func parseACRVerdict(text string) (ACRResult, error) {
 	return res, nil
 }
 
+// ConcurrentReviewSafe reports that each Review builds its own request and
+// shares only the http.Client, which is safe for concurrent use.
+func (a *LLMAgent) ConcurrentReviewSafe() bool { return true }
+
 // Describe names the provider and model for decision provenance.
 func (a *LLMAgent) Describe() string { return "anthropic/" + a.Model }

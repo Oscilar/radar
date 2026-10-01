@@ -77,6 +77,10 @@ func NewAgent(ctx context.Context, model string) (*Agent, error) {
 	return a, nil
 }
 
+// ConcurrentReviewSafe reports that each Review builds its own request and
+// shares only the SDK client, which is safe for concurrent use.
+func (a *Agent) ConcurrentReviewSafe() bool { return true }
+
 // Describe names the provider and model for decision provenance.
 func (a *Agent) Describe() string { return "bedrock/" + a.Model }
 

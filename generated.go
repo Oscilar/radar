@@ -158,8 +158,8 @@ func (m generatedMatcher) pathGenerated(value string) bool {
 
 // classify reports whether a file is withheld and why. Only a generated path
 // withholds, and only for a file that already existed there: a file the
-// change adds, or moves in from a hand-written path, is reviewed in full, so
-// naming a new file like generated code cannot hide it. unlisted is set for
+// change adds or copies, or moves in from a hand-written path, is reviewed in
+// full, so naming a new file like generated code cannot hide it. unlisted is set for
 // a reviewed file that carries a generated-code header outside every
 // generated path.
 func (m generatedMatcher) classify(f PullRequestFile) (reason string, unlisted bool) {
@@ -167,11 +167,12 @@ func (m generatedMatcher) classify(f PullRequestFile) (reason string, unlisted b
 		switch f.Status {
 		case "modified", "removed", "changed":
 			return "path", false
-		case "renamed", "copied":
+		case "renamed":
 			if f.PreviousPath != "" && m.pathGenerated(f.PreviousPath) {
 				return "path", false
 			}
 		}
+		// added and copied create a new file, so they are always reviewed.
 		return "", false
 	}
 	if len(m.headers) > 0 && m.hasHeader(f.Patch) {

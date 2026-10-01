@@ -12,6 +12,8 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -125,7 +127,12 @@ func runReview(args []string) int {
 	}
 	if policy.GeneratedFiles != nil && policy.GeneratedFiles.Gitattributes != "" {
 		// Read from the trusted checkout the policy came from, never the PR head.
-		data, err := os.ReadFile(policy.GeneratedFiles.Gitattributes)
+		path, err := checkoutFile(*policyPath, policy.GeneratedFiles.Gitattributes)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "radar-gh review: locating generated_files.gitattributes:", err)
+			return 1
+		}
+		data, err := os.ReadFile(path)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "radar-gh review: reading generated_files.gitattributes:", err)
 			return 1
@@ -153,8 +160,7 @@ func runReview(args []string) int {
 		fmt.Fprintln(os.Stderr, "radar-gh review:", err)
 		return 1
 	}
-	second.Input.ChecksStable = first.Input.HeadSHA == second.Input.HeadSHA &&
-		first.Input.CheckFingerprint == second.Input.CheckFingerprint
+	second.Input.ChecksStable = snapshotsStable(first.Input, second.Input)
 	if *expectedHead != "" && second.Input.HeadSHA != *expectedHead {
 		fmt.Fprintf(os.Stderr, "radar-gh review: head changed from expected %s to %s\n", *expectedHead, second.Input.HeadSHA)
 		return 1
@@ -190,6 +196,37 @@ func runReview(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// checkoutFile resolves rel against the root of the git checkout holding
+// the policy, so a file the policy names is read from that trusted checkout
+// whatever the working directory.
+func checkoutFile(policyPath, rel string) (string, error) {
+	dir := filepath.Dir(policyPath)
+	out, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return "", fmt.Errorf("policy %s is not inside a git checkout: %w", policyPath, err)
+	}
+	return filepath.Join(strings.TrimSpace(string(out)), rel), nil
+}
+
+// snapshotsStable reports whether two observations show the same pull request
+// state: its head and checks, and for a stacked pull request the same chain
+// of parents at the same heads, since a parent force-push changes the diff
+// without moving this head.
+func snapshotsStable(first, second radar.PullRequestInput) bool {
+	if first.HeadSHA != second.HeadSHA || first.CheckFingerprint != second.CheckFingerprint || first.BaseRef != second.BaseRef {
+		return false
+	}
+	if len(first.Stack) != len(second.Stack) {
+		return false
+	}
+	for i := range first.Stack {
+		if first.Stack[i] != second.Stack[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func loadPullRequestPolicy(path string) (radar.PullRequestPolicy, error) {

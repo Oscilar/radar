@@ -71,7 +71,11 @@ func reviewInChunks(agent ReviewAgent, d Diff, budget int) ACRResult {
 	}
 	start := time.Now()
 	results := make([]ACRResult, len(parts))
-	sem := make(chan struct{}, maxConcurrentChunks)
+	limit := 1
+	if concurrentReviewSafe(agent) {
+		limit = maxConcurrentChunks
+	}
+	sem := make(chan struct{}, limit)
 	var wg sync.WaitGroup
 	for i, part := range parts {
 		wg.Add(1)

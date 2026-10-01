@@ -215,6 +215,22 @@ func (RuleBasedAgent) Review(d Diff) ACRResult {
 	return res
 }
 
+// ConcurrentReviewAgent is implemented by agents whose Review is safe to call
+// from several goroutines at once. Radar reviews the parts of a large diff in
+// parallel only for these; any other agent is called one part at a time.
+type ConcurrentReviewAgent interface {
+	ReviewAgent
+	ConcurrentReviewSafe() bool
+}
+
+func concurrentReviewSafe(agent ReviewAgent) bool {
+	c, ok := agent.(ConcurrentReviewAgent)
+	return ok && c.ConcurrentReviewSafe()
+}
+
+// ConcurrentReviewSafe reports that RuleBasedAgent keeps no state.
+func (RuleBasedAgent) ConcurrentReviewSafe() bool { return true }
+
 // ReviewAgentDescriber is implemented by agents that can name the provider and
 // model behind a verdict, so decision records carry review provenance.
 type ReviewAgentDescriber interface {

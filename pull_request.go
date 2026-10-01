@@ -868,6 +868,13 @@ func compilePathGlob(glob string) (*regexp.Regexp, error) {
 		case '?':
 			b.WriteString("[^/]")
 			i++
+		case '[':
+			class, n, err := globClass(glob[i:])
+			if err != nil {
+				return nil, fmt.Errorf("invalid path pattern %q: %w", glob, err)
+			}
+			b.WriteString(class)
+			i += n
 		default:
 			b.WriteString(regexp.QuoteMeta(string(glob[i])))
 			i++
@@ -875,6 +882,44 @@ func compilePathGlob(glob string) (*regexp.Regexp, error) {
 	}
 	b.WriteString("$")
 	return regexp.Compile(b.String())
+}
+
+// globClass translates a fnmatch character class at the start of s ("[a-z]",
+// "[!0-9]", "[]x]") to a regular expression that, as in git, never matches
+// "/". It returns the expression and how many bytes of s it consumed. An
+// unclosed "[" is a literal, as in fnmatch.
+func globClass(s string) (string, int, error) {
+	j := 1
+	negate := j < len(s) && (s[j] == '!' || s[j] == '^')
+	if negate {
+		j++
+	}
+	start := j
+	if j < len(s) && s[j] == ']' {
+		j++
+	}
+	end := strings.IndexByte(s[j:], ']')
+	if end < 0 {
+		return regexp.QuoteMeta("["), 1, nil
+	}
+	end += j
+	var members strings.Builder
+	for _, r := range s[start:end] {
+		switch r {
+		case '/':
+			continue
+		case '\\', ']', '[', '^':
+			members.WriteRune('\\')
+		}
+		members.WriteRune(r)
+	}
+	if negate {
+		return "[^/" + members.String() + "]", end + 1, nil
+	}
+	if members.Len() == 0 {
+		return "", 0, fmt.Errorf("character class matches nothing")
+	}
+	return "[" + members.String() + "]", end + 1, nil
 }
 
 // SortedIgnoredChecks returns the configured check exclusions in stable order.

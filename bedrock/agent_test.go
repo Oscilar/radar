@@ -133,3 +133,11 @@ func TestReviewRetriesOnceOnMalformedVerdict(t *testing.T) {
 		})
 	}
 }
+
+func TestAgentDeclaresConcurrencySafety(t *testing.T) {
+	var agent radar.ReviewAgent = &Agent{}
+	c, ok := agent.(radar.ConcurrentReviewAgent)
+	if !ok || !c.ConcurrentReviewSafe() {
+		t.Fatal("the bedrock agent must declare ConcurrentReviewSafe so large diffs are reviewed in parallel")
+	}
+}
