@@ -229,3 +229,21 @@ func TestOpenAIAgentRecordsUsageOnSuccess(t *testing.T) {
 		t.Fatalf("usage = %+v (summary %q)", res.Usage, res.Summary)
 	}
 }
+
+func TestOpenAIAgentKeepsUsageOnRefusalAndEmptyOutput(t *testing.T) {
+	for _, tt := range []struct{ name, output, want string }{
+		{"refusal", `[{"type":"message","content":[{"type":"refusal","refusal":"no"}]}]`, "refused"},
+		{"empty", `[]`, "no output text"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`{"status":"completed","usage":{"input_tokens":1200,"output_tokens":40,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}},"output":` + tt.output + `}`))
+			}))
+			defer server.Close()
+			res := (&OpenAIAgent{APIKey: "k", Model: "m", BaseURL: server.URL, HTTP: server.Client()}).Review(Diff{})
+			if res.Accept || !strings.Contains(res.Summary, tt.want) || res.Usage == nil || res.Usage.InputTokens != 1200 || res.Usage.OutputTokens != 40 {
+				t.Fatalf("summary %q usage %+v", res.Summary, res.Usage)
+			}
+		})
+	}
+}

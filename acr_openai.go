@@ -314,9 +314,9 @@ func (a *OpenAIAgent) review(ctx context.Context, d Diff) (ACRResult, error) {
 	}
 	if text.Len() == 0 {
 		if refused {
-			return ACRResult{}, fmt.Errorf("openai API refused review")
+			return ACRResult{Usage: usage}, fmt.Errorf("openai API refused review")
 		}
-		return ACRResult{}, fmt.Errorf("openai API returned no output text")
+		return ACRResult{Usage: usage}, fmt.Errorf("openai API returned no output text")
 	}
 	res, err := parseACRVerdict(text.String())
 	res.Usage = usage
