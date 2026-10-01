@@ -258,5 +258,9 @@ func (a *OpenAIAgent) review(ctx context.Context, d Diff) (ACRResult, error) {
 	return parseACRVerdict(text.String())
 }
 
+// ConcurrentReviewSafe reports that each Review builds its own request and
+// shares only the http.Client, which is safe for concurrent use.
+func (a *OpenAIAgent) ConcurrentReviewSafe() bool { return true }
+
 // Describe names the provider and model for decision provenance.
 func (a *OpenAIAgent) Describe() string { return "openai/" + a.Model }

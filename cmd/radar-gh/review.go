@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -11,12 +12,15 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/travisjeffery/radar"
+	"github.com/travisjeffery/radar/bedrock"
 )
 
 type githubPullRequest struct {
@@ -83,7 +87,7 @@ func runReview(args []string) int {
 	repo := flags.String("repo", "", "GitHub owner/repository (required)")
 	prNumber := flags.Int("pr", 0, "pull request number (required)")
 	policyPath := flags.String("policy", "", "path to a versioned JSON policy (required)")
-	agentName := flags.String("agent", "openai", "review agent: openai, anthropic, fireworks, or rule-based")
+	agentName := flags.String("agent", "openai", "review agents, comma-separated: openai, anthropic, fireworks, bedrock, or rule-based, each optionally name=model")
 	expectedHead := flags.String("expected-head", "", "event head SHA; required in approval mode")
 	settle := flags.Duration("settle", 10*time.Second, "time between check observations")
 	apply := flags.Bool("apply", false, "allow an APPROVE review when policy mode is approve")
@@ -111,15 +115,32 @@ func runReview(args []string) int {
 		}
 	}
 
-	agent, err := newReviewAgent(*agentName)
+	agents, err := newReviewAgents(*agentName)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "radar-gh review:", err)
 		return 1
 	}
-	reviewer, err := radar.NewPullRequestReviewer(policy, radar.HeuristicScorer{}, agent)
+	reviewer, err := radar.NewPullRequestReviewer(policy, radar.HeuristicScorer{}, agents...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "radar-gh review:", err)
 		return 1
+	}
+	if policy.GeneratedFiles != nil && policy.GeneratedFiles.Gitattributes != "" {
+		// Read from the trusted checkout the policy came from, never the PR head.
+		path, err := checkoutFile(*policyPath, policy.GeneratedFiles.Gitattributes)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "radar-gh review: locating generated_files.gitattributes:", err)
+			return 1
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "radar-gh review: reading generated_files.gitattributes:", err)
+			return 1
+		}
+		if err := reviewer.UseGitattributes(data); err != nil {
+			fmt.Fprintln(os.Stderr, "radar-gh review:", err)
+			return 1
+		}
 	}
 
 	first, err := fetchGitHubSnapshot(*repo, *prNumber, policy)
@@ -139,8 +160,7 @@ func runReview(args []string) int {
 		fmt.Fprintln(os.Stderr, "radar-gh review:", err)
 		return 1
 	}
-	second.Input.ChecksStable = first.Input.HeadSHA == second.Input.HeadSHA &&
-		first.Input.CheckFingerprint == second.Input.CheckFingerprint
+	second.Input.ChecksStable = snapshotsStable(first.Input, second.Input)
 	if *expectedHead != "" && second.Input.HeadSHA != *expectedHead {
 		fmt.Fprintf(os.Stderr, "radar-gh review: head changed from expected %s to %s\n", *expectedHead, second.Input.HeadSHA)
 		return 1
@@ -178,6 +198,37 @@ func runReview(args []string) int {
 	return 0
 }
 
+// checkoutFile resolves rel against the root of the git checkout holding
+// the policy, so a file the policy names is read from that trusted checkout
+// whatever the working directory.
+func checkoutFile(policyPath, rel string) (string, error) {
+	dir := filepath.Dir(policyPath)
+	out, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return "", fmt.Errorf("policy %s is not inside a git checkout: %w", policyPath, err)
+	}
+	return filepath.Join(strings.TrimSpace(string(out)), rel), nil
+}
+
+// snapshotsStable reports whether two observations show the same pull request
+// state: its head and checks, and for a stacked pull request the same chain
+// of parents at the same heads, since a parent force-push changes the diff
+// without moving this head.
+func snapshotsStable(first, second radar.PullRequestInput) bool {
+	if first.HeadSHA != second.HeadSHA || first.CheckFingerprint != second.CheckFingerprint || first.BaseRef != second.BaseRef {
+		return false
+	}
+	if len(first.Stack) != len(second.Stack) {
+		return false
+	}
+	for i := range first.Stack {
+		if first.Stack[i] != second.Stack[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func loadPullRequestPolicy(path string) (radar.PullRequestPolicy, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -199,14 +250,52 @@ func loadPullRequestPolicy(path string) (radar.PullRequestPolicy, error) {
 	return policy, nil
 }
 
-func newReviewAgent(name string) (radar.ReviewAgent, error) {
+// newReviewAgents parses -agent: one agent keeps reading $RADAR_ACR_MODEL;
+// with several, each names its own model and $RADAR_ACR_MODEL must be unset
+// so one model id cannot leak into another provider.
+func newReviewAgents(spec string) ([]radar.ReviewAgent, error) {
+	entries := strings.Split(spec, ",")
+	if len(entries) > 1 && os.Getenv("RADAR_ACR_MODEL") != "" {
+		return nil, errors.New("with several agents, give each model as name=model and leave RADAR_ACR_MODEL unset")
+	}
+	seen := map[string]bool{}
+	var agents []radar.ReviewAgent
+	for _, entry := range entries {
+		name, model, explicit := strings.Cut(strings.TrimSpace(entry), "=")
+		if !explicit && len(entries) == 1 {
+			model = os.Getenv("RADAR_ACR_MODEL")
+		}
+		if seen[name] {
+			return nil, fmt.Errorf("agent %q is listed twice", name)
+		}
+		seen[name] = true
+		agent, err := newReviewAgent(name, model)
+		if err != nil {
+			return nil, err
+		}
+		agents = append(agents, agent)
+	}
+	return agents, nil
+}
+
+func newReviewAgent(name, model string) (radar.ReviewAgent, error) {
 	switch name {
 	case "openai":
-		return radar.NewOpenAIAgent()
+		agent, err := radar.NewOpenAIAgent()
+		if err == nil && model != "" {
+			agent.Model = model
+		}
+		return agent, err
 	case "anthropic":
-		return radar.NewLLMAgent()
+		agent, err := radar.NewLLMAgent()
+		if err == nil && model != "" {
+			agent.Model = model
+		}
+		return agent, err
 	case "fireworks":
-		return radar.NewFireworksAgent()
+		return radar.NewFireworksAgentForModel(model)
+	case "bedrock":
+		return bedrock.NewAgent(context.Background(), model)
 	case "rule-based":
 		return radar.RuleBasedAgent{}, nil
 	default:
@@ -238,9 +327,20 @@ func fetchGitHubSnapshot(repo string, number int, policy radar.PullRequestPolicy
 	if err != nil {
 		return githubSnapshot{}, err
 	}
+	var stack []radar.PullRequestStackEntry
+	if policy.AllowStacked && !matchesBranch(pr.Base.Ref, policy.AllowedBaseBranches) {
+		stack, err = fetchStack(repo, pr.Base.Ref, policy.AllowedBaseBranches)
+		if err != nil {
+			return githubSnapshot{}, err
+		}
+	}
+	protectedBase := pr.Base.Ref
+	if len(stack) > 0 {
+		protectedBase = stack[len(stack)-1].BaseRef
+	}
 	staleDismissed := false
 	if policy.Mode == radar.PullRequestModeApprove {
-		staleDismissed, err = staleApprovalsDismissed(repo, pr.Base.Ref)
+		staleDismissed, err = staleApprovalsDismissed(repo, protectedBase)
 		if err != nil {
 			return githubSnapshot{}, fmt.Errorf("reading stale-review protection: %w", err)
 		}
@@ -270,9 +370,69 @@ func fetchGitHubSnapshot(repo string, number int, policy radar.PullRequestPolicy
 			CheckFingerprint:  checks.Fingerprint,
 			UnresolvedThreads: unresolved, ChangesRequested: changesRequested,
 			StaleApprovalsDismissed: staleDismissed, Files: inputFiles,
+			Stack: stack,
 		},
 		ExistingApproval: existingApproval,
 	}, nil
+}
+
+// maxStackDepth bounds the walk down a stack of pull requests.
+const maxStackDepth = 8
+
+// fetchStack walks from base down through the open same-repository pull
+// requests whose head branch each base is, until it reaches an allowed base.
+// It returns nil when base is not another open pull request's head, which
+// the state gate then rejects as a disallowed base.
+func fetchStack(repo, base string, allowed []string) ([]radar.PullRequestStackEntry, error) {
+	owner, _, _ := strings.Cut(repo, "/")
+	var stack []radar.PullRequestStackEntry
+	ref := base
+	for len(stack) < maxStackDepth {
+		var pulls []githubPullRequestRef
+		endpoint := fmt.Sprintf("repos/%s/pulls?state=open&head=%s&per_page=100", repo, url.QueryEscape(owner+":"+ref))
+		if err := ghJSON(&pulls, "api", endpoint); err != nil {
+			return nil, fmt.Errorf("fetching stack parent of %s: %w", ref, err)
+		}
+		var parents []githubPullRequestRef
+		for _, p := range pulls {
+			if p.Head.Ref == ref && strings.EqualFold(p.Head.Repo.FullName, repo) && strings.EqualFold(p.Base.Repo.FullName, repo) {
+				parents = append(parents, p)
+			}
+		}
+		if len(parents) != 1 {
+			// None: not a stack. Several: the branch is the head of more than
+			// one open pull request, so which change sits below is ambiguous.
+			return nil, nil
+		}
+		p := parents[0]
+		stack = append(stack, radar.PullRequestStackEntry{Number: p.Number, HeadRef: p.Head.Ref, HeadSHA: p.Head.SHA, BaseRef: p.Base.Ref})
+		if matchesBranch(p.Base.Ref, allowed) {
+			return stack, nil
+		}
+		ref = p.Base.Ref
+	}
+	return nil, nil
+}
+
+type githubPullRequestRef struct {
+	Number int `json:"number"`
+	Base   struct {
+		Ref  string `json:"ref"`
+		Repo struct {
+			FullName string `json:"full_name"`
+		} `json:"repo"`
+	} `json:"base"`
+	Head struct {
+		Ref  string `json:"ref"`
+		SHA  string `json:"sha"`
+		Repo struct {
+			FullName string `json:"full_name"`
+		} `json:"repo"`
+	} `json:"head"`
+}
+
+func matchesBranch(ref string, allowed []string) bool {
+	return radar.MatchesPathGlob(ref, allowed)
 }
 
 func fetchPullRequestFiles(repo string, number int) ([]githubFile, error) {
@@ -496,6 +656,8 @@ func validateApprovalSnapshot(reviewed, current radar.PullRequestInput, expected
 	switch {
 	case current.HeadSHA != reviewed.HeadSHA || current.HeadSHA != expectedHead:
 		return errors.New("head SHA changed after review")
+	case current.BaseRef != reviewed.BaseRef || len(current.Stack) > 0:
+		return errors.New("base branch changed after review, or the pull request is stacked")
 	case current.CheckFingerprint != reviewed.CheckFingerprint:
 		return errors.New("check state changed after review")
 	case !current.ChecksObserved || !current.ChecksPassing:

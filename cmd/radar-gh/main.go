@@ -204,7 +204,7 @@ func prCI(repo string, number int) radar.CISignal {
 	return ci
 }
 
-func runGH(args ...string) ([]byte, error) {
+var runGH = func(args ...string) ([]byte, error) {
 	cmd := exec.Command("gh", args...)
 	cmd.Stderr = os.Stderr
 	return cmd.Output()

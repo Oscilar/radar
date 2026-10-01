@@ -166,7 +166,7 @@ radar-gh review \
   -pr 123 \
   -policy .github/radar-policy.json \
   -expected-head "$HEAD_SHA" \
-  -agent openai      # or anthropic, fireworks, rule-based
+  -agent openai      # or anthropic, fireworks, rule-based; or a comma list
 ```
 
 The default example policy is `shadow`: a qualifying change produces
@@ -197,6 +197,103 @@ cannot approve the PR. Copy [the generic policy](examples/github-policy.json)
 and [GitHub Actions workflow](examples/github-actions/radar-review.yml) to start
 in shadow mode. Replace the illustrative calibration sample with scores from
 your own merged-PR history before considering approval mode.
+
+#### Deciding from the review findings
+
+A policy with `"approval_basis": "review-findings"` drops the allow rules, the
+global file and line limits, and the risk threshold (the heuristic score grows
+with line count, so it is recorded but does not gate). It must not set them, so
+a policy never looks as if a limit applies when it does not. A reviewer passes
+when it covered every file it was shown, reported confidence of at least
+`min_review_confidence`, raised no finding in `blocking_finding_severities`,
+explained any decline with a recorded signal, and raised no defect signal (`bug-or-logic-error`, `performance-risk`,
+`secrets-exposure`, `sql-injection`, `auth-bypass`). `structural-change` and
+`high-review-effort` describe a change's size and shape, so they are recorded
+but do not block. The state gate, deny paths and deny phrases still apply.
+
+`required_reviewers` (default 1) is how many review agents must run; every one
+must pass. `reviewer_min_confidence` lowers the confidence bar for one
+reviewer, keyed by its provenance (for example
+`{"bedrock/us.anthropic.claude-sonnet-5": 7}`), by at most one point. The rest
+of the bar still applies, so a reviewer passing at its floor has raised no
+blocking finding and no defect signal. Pass several to `-agent`, each with its own model:
+
+```sh
+radar-gh review ... -agent openai,fireworks=accounts/fireworks/models/glm-5p3
+```
+
+With several agents `$RADAR_ACR_MODEL` must be unset. The agents review
+concurrently from one snapshot; the decision records each verdict in `reviews`
+and their conservative merge in `agent`.
+
+A diff larger than `review_chunk_chars` (default 240000, about 60k tokens) is
+reviewed in several requests, each holding whole files and told which part it
+is; the parts' verdicts merge conservatively. A single file over the budget is
+not truncated: that reviewer fails safe and says why.
+
+`-agent bedrock=<inference profile>` reviews with Claude on Amazon Bedrock
+(package `bedrock`, kept out of the core library so it stays dependency-free).
+It uses the AWS default credential chain and `$AWS_REGION`, calls InvokeModel
+through an inference profile such as `us.anthropic.claude-sonnet-5` with
+adaptive thinking (`$RADAR_BEDROCK_EFFORT`, default `high`; output cap
+`$RADAR_BEDROCK_MAX_TOKENS`, default 64000), and takes the verdict as the input
+of a `submit_verdict` tool, because Bedrock rejects `output_config.format` and
+strict tools for Claude. A response cut off at the output cap is marked
+`truncated`; Radar then reviews that part again in halves, up to three times,
+and a verdict that is still truncated never passes. Every verdict records its
+token `usage`.
+
+#### Generated files
+
+`generated_files` withholds generated files from the review agents, which see
+only their path, status and line counts. Paths come from `generated_files.paths`
+and from the `linguist-generated` entries of the root `.gitattributes`
+(`generated_files.gitattributes: ".gitattributes"`), read from the trusted
+checkout the policy is read from and never from the pull request head, so a
+change cannot mark its own files generated. As in git, the last matching
+`.gitattributes` line decides. Only a file that already existed at a generated
+path is withheld: a file the change adds there, or renames in from a
+hand-written path, is reviewed in full, so naming a new file like generated code
+cannot hide it. `header_markers` (regular expressions for headers such as
+`Code generated ... DO NOT EDIT.` or `@generated`) never withhold anything,
+since anyone can write a header; a reviewed file that carries one outside every
+generated path is listed in `generated_unlisted`, so its generator path can be
+added. Withheld files still count for deny paths and phrases, and a pull request
+whose every file is withheld routes to a human. `generated_files.note` is passed
+to the agents, for example to say which CI checks verify generated output. The
+decision lists what was withheld in `withheld`.
+
+#### Lockfiles
+
+With a `lockfiles` block, recognised lockfiles (`gradle.lockfile`,
+`poetry.lock`, `uv.lock`, `go.sum`, `package-lock.json`) are never withheld as
+generated. Each agent gets a summary parsed from the patches (per package: old
+and new version, added or removed, and changes to where it is resolved from or
+to an integrity hash without a version change) followed by the raw lines. A
+lockfile whose +/- lines and summary repeat an earlier one's, as when one bump
+regenerates many Gradle lockfiles, is shown as a pointer to the first; one too
+large for a request is split by hunk across parts instead of failing. The
+prompt makes supply-chain signals P1 findings: typosquats, new or changed
+sources, downgrades, hash-only changes, and lockfile changes without a matching
+manifest change. Two deterministic backstops route to a human:
+`require_human_without_manifest` (no `pyproject.toml`, `go.mod` or
+`package.json` change beside the lockfile; for Gradle, no build script, version
+catalog or `gradle.properties` change anywhere) and
+`require_human_on_source_change` (any registry, index, git or URL source
+change). The decision records the summaries in `lockfiles`.
+
+#### Stacked pull requests
+
+With `allow_stacked`, a pull request whose base is another open
+same-repository pull request's head branch is evaluated when the chain of open
+pull requests below it (at most 8) ends on an allowed base. The diff is GitHub's
+diff against the pull request's own base, so the verdict covers its own changes
+only, and `stack` records the pull requests below it. A stacked pull request is
+never approved, even in approve mode: it stops at `would-approve`, because an
+approval would survive a retarget to `main` that brings the unreviewed changes
+below it into the diff. Once it targets an allowed base it is evaluated like any
+other pull request. A base branch that heads more than one open pull request is
+treated as unstacked.
 
 Approval is an explicit second rollout. Change the policy mode to `approve`,
 enable GitHub's branch-protection setting that dismisses stale approvals, and

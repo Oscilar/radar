@@ -103,6 +103,35 @@ type ACRResult struct {
 	// agents that measure latency (always, even when it rounds to 0) and nil for
 	// agents that do not, so the two cases stay distinguishable in decisions.
 	ElapsedMS *int64 `json:"elapsed_ms,omitempty"`
+	// Truncated is set when the response hit the agent's output limit. Radar
+	// then reviews the part again in halves; a truncated verdict never passes.
+	Truncated bool `json:"truncated,omitempty"`
+	// Usage is what the review cost in tokens, when the provider reports it.
+	Usage *ReviewUsage `json:"usage,omitempty"`
+}
+
+// ReviewUsage counts the tokens one review used, summed over its requests.
+type ReviewUsage struct {
+	InputTokens      int64 `json:"input_tokens"`
+	OutputTokens     int64 `json:"output_tokens"`
+	CacheReadTokens  int64 `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens int64 `json:"cache_write_tokens,omitempty"`
+	Requests         int   `json:"requests"`
+}
+
+func (u *ReviewUsage) add(o *ReviewUsage) *ReviewUsage {
+	if o == nil {
+		return u
+	}
+	if u == nil {
+		u = &ReviewUsage{}
+	}
+	u.InputTokens += o.InputTokens
+	u.OutputTokens += o.OutputTokens
+	u.CacheReadTokens += o.CacheReadTokens
+	u.CacheWriteTokens += o.CacheWriteTokens
+	u.Requests += o.Requests
+	return u
 }
 
 // ReviewFinding is one structured issue found by a ReviewAgent.
@@ -185,6 +214,22 @@ func (RuleBasedAgent) Review(d Diff) ACRResult {
 	}
 	return res
 }
+
+// ConcurrentReviewAgent is implemented by agents whose Review is safe to call
+// from several goroutines at once. Radar reviews the parts of a large diff in
+// parallel only for these; any other agent is called one part at a time.
+type ConcurrentReviewAgent interface {
+	ReviewAgent
+	ConcurrentReviewSafe() bool
+}
+
+func concurrentReviewSafe(agent ReviewAgent) bool {
+	c, ok := agent.(ConcurrentReviewAgent)
+	return ok && c.ConcurrentReviewSafe()
+}
+
+// ConcurrentReviewSafe reports that RuleBasedAgent keeps no state.
+func (RuleBasedAgent) ConcurrentReviewSafe() bool { return true }
 
 // ReviewAgentDescriber is implemented by agents that can name the provider and
 // model behind a verdict, so decision records carry review provenance.

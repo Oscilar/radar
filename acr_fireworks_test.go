@@ -418,3 +418,20 @@ func TestFireworksAgentEmitsElapsedEvenWhenZero(t *testing.T) {
 		t.Fatalf("agents that do not measure latency must omit elapsed_ms: %s", rule)
 	}
 }
+
+func TestFireworksAgentReportsTruncationAndUsage(t *testing.T) {
+	body := `{"model":"` + fireworksTestModel + `","usage":{"prompt_tokens":1200,"completion_tokens":24576},"choices":[{"finish_reason":"length","message":{"content":"{\"accept\":tr"}}]}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(body)) }))
+	defer server.Close()
+	agent := &FireworksAgent{APIKey: "test-key", Model: fireworksTestModel, BaseURL: server.URL, HTTP: server.Client()}
+	got := agent.Review(Diff{})
+	if !got.Truncated || got.Usage == nil || got.Usage.OutputTokens != 24576 || got.Usage.InputTokens != 1200 {
+		t.Fatalf("truncation and usage not reported: %+v usage=%+v", got, got.Usage)
+	}
+
+	body = `{"model":"` + fireworksTestModel + `","usage":{"prompt_tokens":10,"completion_tokens":5},"choices":[{"finish_reason":"stop","message":{"content":"{\"accept\":false,\"confidence\":4,\"risk_signals\":[],\"safe_signals\":[],\"reviewed_files\":[\"a\"],\"findings\":[],\"summary\":\"s\"}"}}]}`
+	got = agent.Review(Diff{})
+	if got.Truncated || got.Usage == nil || got.Usage.Requests != 1 || got.Usage.OutputTokens != 5 {
+		t.Fatalf("usage not recorded on success: %+v usage=%+v", got, got.Usage)
+	}
+}
