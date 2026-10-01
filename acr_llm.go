@@ -75,10 +75,14 @@ RISK signals (require a human): high-review-effort, structural-change, bug-or-lo
 
 Auto-accept ONLY if your confidence is at least 8/10, every change has a recognized safe signal, there are zero risk signals, and there are no P0 or P1 findings. If any of those conditions fail, do not accept. Still report every P2 and P3 finding you see: Radar's policy decides whether they block, so do not decline solely because of a P2 or P3 finding.
 
+Every concrete concern that would make you decline, other than the change's size or structural scope, must also appear in findings with a severity: a policy may decide from the findings alone. Confidence is how sure you are of your assessment and that your findings are complete.
+
+Generated files may be listed by name without a patch. You cannot review their content; flag a problem only if their presence or size is itself suspicious next to the patches shown.
+
 Respond with ONLY a JSON object, no prose, of the form:
 {"accept": bool, "confidence": int 0-10, "risk_signals": [string], "safe_signals": [string], "reviewed_files": [string], "findings": [{"severity":"P0|P1|P2|P3", "title":string, "file":string, "line":int, "summary":string}], "summary": string}
 
-reviewed_files must contain every changed file path exactly once.`
+reviewed_files must contain every file whose patch is shown, exactly once.`
 
 // anthropic request/response shapes (minimal subset).
 type anthropicReq struct {
@@ -178,8 +182,21 @@ func (a *LLMAgent) review(ctx context.Context, d Diff) (ACRResult, error) {
 func renderDiffForReview(d Diff) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Diff %s (org %s, source %s)\n\n", d.ID, d.Org, d.Source)
+	if d.Parts > 1 {
+		fmt.Fprintf(&b, "This is part %d of %d of the change. The other parts are reviewed in separate requests; judge only the patches shown here, and list only them in reviewed_files.\n\n", d.Part, d.Parts)
+	}
+	for _, note := range d.ReviewNotes {
+		fmt.Fprintf(&b, "Note: %s\n\n", note)
+	}
 	for i, c := range d.Changes {
 		fmt.Fprintf(&b, "--- change %d: %s (complexity %d) ---\n%s\n\n", i+1, c.File, c.Complexity, c.Content)
+	}
+	if len(d.Withheld) > 0 {
+		b.WriteString("--- generated files changed but not shown (do not list them in reviewed_files) ---\n")
+		for _, w := range d.Withheld {
+			fmt.Fprintf(&b, "%s (%s, +%d/-%d)\n", w.Path, w.Status, w.Additions, w.Deletions)
+		}
+		b.WriteString("\n")
 	}
 	return b.String()
 }

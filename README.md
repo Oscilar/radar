@@ -166,7 +166,7 @@ radar-gh review \
   -pr 123 \
   -policy .github/radar-policy.json \
   -expected-head "$HEAD_SHA" \
-  -agent openai      # or anthropic, fireworks, rule-based
+  -agent openai      # or anthropic, fireworks, rule-based; or a comma list
 ```
 
 The default example policy is `shadow`: a qualifying change produces
@@ -197,6 +197,68 @@ cannot approve the PR. Copy [the generic policy](examples/github-policy.json)
 and [GitHub Actions workflow](examples/github-actions/radar-review.yml) to start
 in shadow mode. Replace the illustrative calibration sample with scores from
 your own merged-PR history before considering approval mode.
+
+#### Deciding from the review findings
+
+A policy with `"approval_basis": "review-findings"` drops the allow rules, the
+global file and line limits, and the risk threshold (the heuristic score grows
+with line count, so it is recorded but does not gate). It must not set them, so
+a policy never looks as if a limit applies when it does not. A reviewer passes
+when it covered every file it was shown, reported confidence of at least
+`min_review_confidence`, raised no finding in `blocking_finding_severities`,
+explained any decline with a recorded signal, and raised no defect signal (`bug-or-logic-error`, `performance-risk`,
+`secrets-exposure`, `sql-injection`, `auth-bypass`). `structural-change` and
+`high-review-effort` describe a change's size and shape, so they are recorded
+but do not block. The state gate, deny paths and deny phrases still apply.
+
+`required_reviewers` (default 1) is how many review agents must run; every one
+must pass. Pass several to `-agent`, each with its own model:
+
+```sh
+radar-gh review ... -agent openai,fireworks=accounts/fireworks/models/glm-5p3
+```
+
+With several agents `$RADAR_ACR_MODEL` must be unset. The agents review
+concurrently from one snapshot; the decision records each verdict in `reviews`
+and their conservative merge in `agent`.
+
+A diff larger than `review_chunk_chars` (default 240000, about 60k tokens) is
+reviewed in several requests, each holding whole files and told which part it
+is; the parts' verdicts merge conservatively. A single file over the budget is
+not truncated: that reviewer fails safe and says why.
+
+#### Generated files
+
+`generated_files` withholds generated files from the review agents, which see
+only their path, status and line counts. Paths come from `generated_files.paths`
+and from the `linguist-generated` entries of the root `.gitattributes`
+(`generated_files.gitattributes: ".gitattributes"`), read from the trusted
+checkout the policy is read from and never from the pull request head, so a
+change cannot mark its own files generated. As in git, the last matching
+`.gitattributes` line decides. Only a file that already existed at a generated
+path is withheld: a file the change adds there, or renames in from a
+hand-written path, is reviewed in full, so naming a new file like generated code
+cannot hide it. `header_markers` (regular expressions for headers such as
+`Code generated ... DO NOT EDIT.` or `@generated`) never withhold anything,
+since anyone can write a header; a reviewed file that carries one outside every
+generated path is listed in `generated_unlisted`, so its generator path can be
+added. Withheld files still count for deny paths and phrases, and a pull request
+whose every file is withheld routes to a human. `generated_files.note` is passed
+to the agents, for example to say which CI checks verify generated output. The
+decision lists what was withheld in `withheld`.
+
+#### Stacked pull requests
+
+With `allow_stacked`, a pull request whose base is another open
+same-repository pull request's head branch is evaluated when the chain of open
+pull requests below it (at most 8) ends on an allowed base. The diff is GitHub's
+diff against the pull request's own base, so the verdict covers its own changes
+only, and `stack` records the pull requests below it. A stacked pull request is
+never approved, even in approve mode: it stops at `would-approve`, because an
+approval would survive a retarget to `main` that brings the unreviewed changes
+below it into the diff. Once it targets an allowed base it is evaluated like any
+other pull request. A base branch that heads more than one open pull request is
+treated as unstacked.
 
 Approval is an explicit second rollout. Change the policy mode to `approve`,
 enable GitHub's branch-protection setting that dismisses stale approvals, and

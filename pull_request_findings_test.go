@@ -1,0 +1,565 @@
+package radar
+
+import (
+	"fmt"
+	"strings"
+	"sync"
+	"testing"
+)
+
+func findingsPolicy(mode PullRequestMode) PullRequestPolicy {
+	p := testPullRequestPolicy(mode)
+	p.ApprovalBasis = ApprovalBasisReviewFindings
+	p.AllowRules = nil
+	p.MaxFiles, p.MaxChangedLines = 0, 0
+	p.MaxRiskPercentile = 0
+	p.MinReviewConfidence = 8
+	p.BlockingFindingSeverities = []string{"P0", "P1"}
+	return p
+}
+
+// recordingAgent returns result with ReviewedFiles set to the files it was
+// shown, and remembers every diff it received.
+type recordingAgent struct {
+	mu     sync.Mutex
+	result ACRResult
+	seen   []Diff
+}
+
+func (a *recordingAgent) Review(d Diff) ACRResult {
+	a.mu.Lock()
+	a.seen = append(a.seen, d)
+	a.mu.Unlock()
+	res := a.result
+	res.ReviewedFiles = nil
+	for _, c := range d.Changes {
+		res.ReviewedFiles = append(res.ReviewedFiles, c.File)
+	}
+	return res
+}
+
+func largeFeatureInput(files int) PullRequestInput {
+	in := safePullRequestInput()
+	in.Files = nil
+	for i := range files {
+		in.Files = append(in.Files, PullRequestFile{
+			Path: fmt.Sprintf("service/src/main/java/Feature%d.java", i), Status: "added",
+			Additions: 100, Patch: "@@ -0,0 +1,100 @@\n" + strings.Repeat("+line\n", 99) + "+line",
+			ContentComplete: true,
+		})
+	}
+	return in
+}
+
+func structuralVerdict() ACRResult {
+	return ACRResult{
+		Confidence:  9,
+		RiskSignals: []ChangeSignal{SignalStructuralChange, SignalHighReviewEffort},
+		Findings:    []ReviewFinding{{Severity: "P2", Title: "naming", Summary: "consider renaming"}},
+		Summary:     "new feature, no defects found",
+	}
+}
+
+func TestReviewFindingsApprovesLargeChangeWithoutDefects(t *testing.T) {
+	agent := &recordingAgent{result: structuralVerdict()}
+	reviewer, err := NewPullRequestReviewer(findingsPolicy(PullRequestModeShadow), fixedScorer(1000), agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := reviewer.Review(largeFeatureInput(40))
+	if got.Action != PullRequestWouldApprove || !got.Eligible || got.ApprovalBasis != ApprovalBasisReviewFindings {
+		t.Fatalf("got %s; stages %+v", got.Action, got.Stages)
+	}
+	for _, stage := range got.Stages {
+		if stage.Name == "pr.allow-rule" || stage.Name == "pr.risk-threshold" {
+			t.Fatalf("review-findings must not run %s", stage.Name)
+		}
+	}
+}
+
+func TestReviewFindingsBlocks(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*ACRResult)
+	}{
+		{"P1 finding", func(r *ACRResult) {
+			r.Findings = append(r.Findings, ReviewFinding{Severity: "P1", Title: "bug", Summary: "breaks"})
+		}},
+		{"defect signal", func(r *ACRResult) { r.RiskSignals = append(r.RiskSignals, SignalBugOrLogicError) }},
+		{"low confidence", func(r *ACRResult) { r.Confidence = 7 }},
+		{"agent error", func(r *ACRResult) { *r = ACRResult{Summary: "ACR OpenAI error, failing safe"} }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			verdict := structuralVerdict()
+			tt.mutate(&verdict)
+			reviewer, err := NewPullRequestReviewer(findingsPolicy(PullRequestModeShadow), fixedScorer(0), &recordingAgent{result: verdict})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := reviewer.Review(largeFeatureInput(3)); got.Action != PullRequestRouteToHuman {
+				t.Fatalf("got %s; stages %+v", got.Action, got.Stages)
+			}
+		})
+	}
+}
+
+func TestReviewFindingsRequiresFullCoverage(t *testing.T) {
+	verdict := structuralVerdict()
+	verdict.ReviewedFiles = []string{"service/src/main/java/Feature0.java"}
+	reviewer, err := NewPullRequestReviewer(findingsPolicy(PullRequestModeShadow), fixedScorer(0), fixedVerdictAgent{verdict})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reviewer.Review(largeFeatureInput(2)); got.Action != PullRequestRouteToHuman {
+		t.Fatalf("partial coverage must route to human, got %s", got.Action)
+	}
+}
+
+func TestReviewFindingsKeepsDenyPaths(t *testing.T) {
+	reviewer, err := NewPullRequestReviewer(findingsPolicy(PullRequestModeShadow), fixedScorer(0), &recordingAgent{result: structuralVerdict()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := largeFeatureInput(2)
+	in.Files[1].Path = "service/security/Filter.java"
+	if got := reviewer.Review(in); got.Action != PullRequestRouteToHuman {
+		t.Fatalf("deny path must route to human, got %s", got.Action)
+	}
+}
+
+func TestReviewFindingsPolicyRejectsSizeLimits(t *testing.T) {
+	p := findingsPolicy(PullRequestModeShadow)
+	if err := p.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	p.MaxFiles = 20
+	if err := p.Validate(); err == nil {
+		t.Fatal("global limits must be rejected under review-findings")
+	}
+	p = findingsPolicy(PullRequestModeShadow)
+	p.AllowRules = testPullRequestPolicy(PullRequestModeShadow).AllowRules
+	if err := p.Validate(); err == nil {
+		t.Fatal("allow rules must be rejected under review-findings")
+	}
+	p = findingsPolicy(PullRequestModeShadow)
+	p.ApprovalBasis = "vibes"
+	if err := p.Validate(); err == nil {
+		t.Fatal("unknown basis must be rejected")
+	}
+}
+
+type namedAgent struct {
+	*recordingAgent
+	name string
+}
+
+func (a namedAgent) Describe() string { return a.name }
+
+func TestReviewConsensusRequiresEveryReviewer(t *testing.T) {
+	policy := findingsPolicy(PullRequestModeShadow)
+	policy.RequiredReviewers = 2
+	pass := namedAgent{&recordingAgent{result: structuralVerdict()}, "openai/a"}
+	blocked := structuralVerdict()
+	blocked.Findings = []ReviewFinding{{Severity: "P0", Title: "data loss", Summary: "drops rows"}}
+	fail := namedAgent{&recordingAgent{result: blocked}, "fireworks/b"}
+
+	if _, err := NewPullRequestReviewer(policy, fixedScorer(0), pass); err == nil {
+		t.Fatal("fewer agents than required_reviewers must be rejected")
+	}
+
+	reviewer, err := NewPullRequestReviewer(policy, fixedScorer(0), pass, fail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := reviewer.Review(largeFeatureInput(2))
+	if got.Action != PullRequestRouteToHuman {
+		t.Fatalf("one blocking reviewer must route to human, got %s", got.Action)
+	}
+	if len(got.Reviews) != 2 || !got.Reviews[0].Passed || got.Reviews[1].Passed || got.Reviewer != "openai/a+fireworks/b" {
+		t.Fatalf("reviews = %+v reviewer=%q", got.Reviews, got.Reviewer)
+	}
+	if len(got.Agent.Findings) != 2 {
+		t.Fatalf("merged verdict must carry every finding, got %+v", got.Agent.Findings)
+	}
+
+	reviewer, err = NewPullRequestReviewer(policy, fixedScorer(0), pass, namedAgent{&recordingAgent{result: structuralVerdict()}, "fireworks/b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reviewer.Review(largeFeatureInput(2)); got.Action != PullRequestWouldApprove {
+		t.Fatalf("agreeing reviewers must pass, got %s; stages %+v", got.Action, got.Stages)
+	}
+}
+
+func stackedInput() PullRequestInput {
+	in := largeFeatureInput(2)
+	in.Number = 44
+	in.BaseRef = "ram/wf-1631"
+	in.Stack = []PullRequestStackEntry{
+		{Number: 43, HeadRef: "ram/wf-1631", HeadSHA: strings.Repeat("c", 40), BaseRef: "ram/wf-1630"},
+		{Number: 42, HeadRef: "ram/wf-1630", HeadSHA: strings.Repeat("b", 40), BaseRef: "main"},
+	}
+	return in
+}
+
+func TestStackedPullRequests(t *testing.T) {
+	policy := findingsPolicy(PullRequestModeShadow)
+	reviewer, err := NewPullRequestReviewer(policy, fixedScorer(0), &recordingAgent{result: structuralVerdict()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reviewer.Review(stackedInput()); got.Action != PullRequestRouteToHuman {
+		t.Fatalf("stacks must be opt-in, got %s", got.Action)
+	}
+
+	policy.AllowStacked = true
+	reviewer, err = NewPullRequestReviewer(policy, fixedScorer(0), &recordingAgent{result: structuralVerdict()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := reviewer.Review(stackedInput())
+	if got.Action != PullRequestWouldApprove || len(got.Stack) != 2 || got.Stack[0].Number != 43 {
+		t.Fatalf("got %s stack=%+v; stages %+v", got.Action, got.Stack, got.Stages)
+	}
+
+	broken := stackedInput()
+	broken.Stack[1].HeadRef = "someone/else"
+	if got := reviewer.Review(broken); got.Action != PullRequestRouteToHuman {
+		t.Fatalf("a broken chain must route to human, got %s", got.Action)
+	}
+	offMain := stackedInput()
+	offMain.Stack[1].BaseRef = "release/1"
+	if got := reviewer.Review(offMain); got.Action != PullRequestRouteToHuman {
+		t.Fatalf("a stack off a disallowed base must route to human, got %s", got.Action)
+	}
+	cycle := stackedInput()
+	cycle.Stack[1].Number = 44
+	if got := reviewer.Review(cycle); got.Action != PullRequestRouteToHuman {
+		t.Fatalf("a stack containing the PR itself must route to human, got %s", got.Action)
+	}
+}
+
+func TestStackedPullRequestIsNeverApproved(t *testing.T) {
+	policy := findingsPolicy(PullRequestModeApprove)
+	policy.AllowStacked = true
+	reviewer, err := NewPullRequestReviewer(policy, fixedScorer(0), &recordingAgent{result: structuralVerdict()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := reviewer.Review(stackedInput())
+	if got.Action != PullRequestWouldApprove {
+		t.Fatalf("approve mode must stop at would-approve for a stacked PR, got %s", got.Action)
+	}
+	unstacked := largeFeatureInput(2)
+	if got := reviewer.Review(unstacked); got.Action != PullRequestApprove {
+		t.Fatalf("the same change on main must approve, got %s; stages %+v", got.Action, got.Stages)
+	}
+}
+
+const gitattributesFixture = `# comment
+*.sh text eol=lf
+gradle.lockfile linguist-generated=true
+/python-models/src/models/** linguist-generated
+**/*_gen.go linguist-generated
+docs/generated.md linguist-generated
+docs/generated.md -linguist-generated
+`
+
+func TestParseGitattributesGenerated(t *testing.T) {
+	got, err := ParseGitattributesGenerated([]byte(gitattributesFixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []GitattributesRule{
+		{"**/gradle.lockfile", true}, {"python-models/src/models/**", true}, {"**/*_gen.go", true},
+		{"docs/generated.md", true}, {"docs/generated.md", false},
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	if _, err := ParseGitattributesGenerated([]byte(`"quoted path" linguist-generated`)); err == nil {
+		t.Fatal("quoted patterns must be rejected, not misread")
+	}
+}
+
+func TestGitattributesLastMatchWins(t *testing.T) {
+	m := newGeneratedMatcher(PullRequestGeneratedFiles{}, mustRules(t, "*.go linguist-generated\nhandwritten/*.go -linguist-generated\n"))
+	modified := func(path string) PullRequestFile { return PullRequestFile{Path: path, Status: "modified"} }
+	if reason, _ := m.classify(modified("api/client.go")); reason != "path" {
+		t.Fatal("api/client.go should be generated")
+	}
+	if reason, _ := m.classify(modified("handwritten/auth.go")); reason != "" {
+		t.Fatal("a later unset for a different pattern must win, as in git")
+	}
+}
+
+func TestGeneratedFilesPolicyRequiresRootGitattributes(t *testing.T) {
+	p := generatedPolicy()
+	p.GeneratedFiles.Gitattributes = "api/.gitattributes"
+	if err := p.Validate(); err == nil {
+		t.Fatal("a nested .gitattributes must be rejected: its patterns are relative to its directory")
+	}
+	p.GeneratedFiles.Gitattributes = ".gitattributes"
+	if err := p.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustRules(t *testing.T, data string) []GitattributesRule {
+	t.Helper()
+	rules, err := ParseGitattributesGenerated([]byte(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rules
+}
+
+func TestNewFileAtGeneratedPathIsReviewed(t *testing.T) {
+	reviewer, err := NewPullRequestReviewer(generatedPolicy(), fixedScorer(0), &recordingAgent{result: structuralVerdict()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reviewer.UseGitattributes([]byte(gitattributesFixture)); err != nil {
+		t.Fatal(err)
+	}
+	in := largeFeatureInput(1)
+	in.Files = append(in.Files, PullRequestFile{
+		Path: "internal/auth/bypass_gen.go", Status: "added", Additions: 1,
+		Patch: "@@ -0,0 +1 @@\n+package auth", ContentComplete: true,
+	})
+	if got := reviewer.Review(in); len(got.Withheld) != 0 {
+		t.Fatalf("a new file must be reviewed even under a generated name: %+v", got.Withheld)
+	}
+}
+
+func TestReviewFindingsUnexplainedDeclineBlocks(t *testing.T) {
+	declined := ACRResult{Confidence: 9, Summary: "something feels off"}
+	reviewer, err := NewPullRequestReviewer(findingsPolicy(PullRequestModeShadow), fixedScorer(0), &recordingAgent{result: declined})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reviewer.Review(largeFeatureInput(1)); got.Action != PullRequestRouteToHuman {
+		t.Fatalf("a decline with no finding or signal must route to human, got %s", got.Action)
+	}
+	declined.Findings = []ReviewFinding{{Severity: "P2", Title: "naming", Summary: "unclear name"}}
+	reviewer, err = NewPullRequestReviewer(findingsPolicy(PullRequestModeShadow), fixedScorer(0), &recordingAgent{result: declined})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reviewer.Review(largeFeatureInput(1)); got.Action != PullRequestWouldApprove {
+		t.Fatalf("a decline explained by a non-blocking finding must pass, got %s", got.Action)
+	}
+	declined.Findings = nil
+	declined.ModelAccept = true
+	reviewer, err = NewPullRequestReviewer(findingsPolicy(PullRequestModeShadow), fixedScorer(0), &recordingAgent{result: declined})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reviewer.Review(largeFeatureInput(1)); got.Action != PullRequestWouldApprove {
+		t.Fatalf("an accepting clean review must pass, got %s", got.Action)
+	}
+}
+
+func generatedPolicy() PullRequestPolicy {
+	p := findingsPolicy(PullRequestModeShadow)
+	p.GeneratedFiles = &PullRequestGeneratedFiles{
+		Paths:         []string{"**/*.snap"},
+		HeaderMarkers: []string{`^// Code generated .* DO NOT EDIT\.$`, `@generated`},
+		Note:          "CI verifies lockfiles are in sync.",
+	}
+	return p
+}
+
+func TestGeneratedFilesWithheld(t *testing.T) {
+	agent := &recordingAgent{result: structuralVerdict()}
+	reviewer, err := NewPullRequestReviewer(generatedPolicy(), fixedScorer(0), agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reviewer.UseGitattributes([]byte(gitattributesFixture)); err != nil {
+		t.Fatal(err)
+	}
+	in := largeFeatureInput(1)
+	in.Files = append(in.Files,
+		PullRequestFile{Path: "service/gradle.lockfile", Status: "modified", Additions: 500, Deletions: 400, Patch: "@@ -1 +1 @@\n-a\n+b", ContentComplete: true},
+		PullRequestFile{Path: "ui/__snapshots__/a.snap", Status: "modified", Additions: 3, Patch: "@@ -1 +1 @@\n+x", ContentComplete: true},
+	)
+	got := reviewer.Review(in)
+	if got.Action != PullRequestWouldApprove {
+		t.Fatalf("got %s; stages %+v", got.Action, got.Stages)
+	}
+	if len(got.Withheld) != 2 || got.Withheld[0].Path != "service/gradle.lockfile" || got.Withheld[0].Additions != 500 {
+		t.Fatalf("withheld = %+v", got.Withheld)
+	}
+	seen := agent.seen[0]
+	if len(seen.Changes) != 1 || len(seen.Withheld) != 2 || len(seen.ReviewNotes) != 1 {
+		t.Fatalf("agent saw %+v", seen)
+	}
+	prompt := renderDiffForReview(seen)
+	if !strings.Contains(prompt, "service/gradle.lockfile (modified, +500/-400)") || strings.Contains(prompt, "\n+b") {
+		t.Fatalf("prompt must list withheld files without their patches:\n%s", prompt)
+	}
+}
+
+func TestGeneratedFilesStillHitDenyPaths(t *testing.T) {
+	policy := generatedPolicy()
+	policy.DenyPaths = append(policy.DenyPaths, "**/gradle.lockfile")
+	reviewer, err := NewPullRequestReviewer(policy, fixedScorer(0), &recordingAgent{result: structuralVerdict()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reviewer.UseGitattributes([]byte(gitattributesFixture)); err != nil {
+		t.Fatal(err)
+	}
+	in := largeFeatureInput(1)
+	in.Files = append(in.Files, PullRequestFile{Path: "gradle.lockfile", Status: "modified", Additions: 1, Patch: "@@ -1 +1 @@\n+b", ContentComplete: true})
+	if got := reviewer.Review(in); got.Action != PullRequestRouteToHuman {
+		t.Fatalf("withholding must not bypass deny paths, got %s", got.Action)
+	}
+}
+
+func TestGeneratedHeaderOrigin(t *testing.T) {
+	tests := []struct {
+		name         string
+		file         PullRequestFile
+		wantWithheld bool
+		wantUnlisted bool
+	}{
+		{
+			// A header someone added in an earlier change would look the same.
+			name: "pre-existing header on a modified file",
+			file: PullRequestFile{Path: "api/client.go", Status: "modified", Additions: 1, Deletions: 1,
+				Patch: "@@ -1,3 +1,3 @@\n // Code generated by oapi-codegen. DO NOT EDIT.\n package api\n-var a = 1\n+var a = 2"},
+			wantUnlisted: true,
+		},
+		{
+			name: "header added by this change",
+			file: PullRequestFile{Path: "service/handler.go", Status: "modified", Additions: 2, Deletions: 0,
+				Patch: "@@ -1,2 +1,3 @@\n+// Code generated by hand. DO NOT EDIT.\n package service\n+var x = 1"},
+			wantUnlisted: true,
+		},
+		{
+			name: "new file with a header",
+			file: PullRequestFile{Path: "service/new.ts", Status: "added", Additions: 2,
+				Patch: "@@ -0,0 +1,2 @@\n+/* @generated */\n+export const x = 1"},
+			wantUnlisted: true,
+		},
+		{
+			name: "header out of view",
+			file: PullRequestFile{Path: "api/client.go", Status: "modified", Additions: 1, Deletions: 1,
+				Patch: "@@ -40,3 +40,3 @@\n context\n-old\n+new"},
+		},
+		{
+			name: "renamed file keeps the header",
+			file: PullRequestFile{Path: "api/v2/client.go", PreviousPath: "api/client.go", Status: "renamed", Additions: 1, Deletions: 1,
+				Patch: "@@ -1,2 +1,2 @@\n // Code generated by oapi-codegen. DO NOT EDIT.\n-a\n+b"},
+			wantUnlisted: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			agent := &recordingAgent{result: structuralVerdict()}
+			reviewer, err := NewPullRequestReviewer(generatedPolicy(), fixedScorer(0), agent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			in := largeFeatureInput(1)
+			tt.file.ContentComplete = true
+			in.Files = append(in.Files, tt.file)
+			got := reviewer.Review(in)
+			withheld := len(got.Withheld) == 1
+			unlisted := len(got.GeneratedUnlisted) == 1
+			if withheld != tt.wantWithheld || unlisted != tt.wantUnlisted {
+				t.Fatalf("withheld=%v unlisted=%v, want %t/%t", got.Withheld, got.GeneratedUnlisted, tt.wantWithheld, tt.wantUnlisted)
+			}
+			if !withheld && len(agent.seen[0].Changes) != 2 {
+				t.Fatal("a file that is not withheld must be reviewed in full")
+			}
+		})
+	}
+}
+
+func TestGeneratedPathRenamedFromHandWritten(t *testing.T) {
+	reviewer, err := NewPullRequestReviewer(generatedPolicy(), fixedScorer(0), &recordingAgent{result: structuralVerdict()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := largeFeatureInput(1)
+	in.Files = append(in.Files, PullRequestFile{
+		Path: "ui/a.snap", PreviousPath: "ui/handler.ts", Status: "renamed", Additions: 1,
+		Patch: "@@ -1 +1 @@\n+x", ContentComplete: true,
+	})
+	if got := reviewer.Review(in); len(got.Withheld) != 0 {
+		t.Fatalf("moving a hand-written file under a generated name must not hide it: %+v", got.Withheld)
+	}
+}
+
+func TestAllGeneratedRoutesToHuman(t *testing.T) {
+	agent := &recordingAgent{result: structuralVerdict()}
+	reviewer, err := NewPullRequestReviewer(generatedPolicy(), fixedScorer(0), agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := safePullRequestInput()
+	in.Files = []PullRequestFile{{Path: "ui/a.snap", Status: "modified", Additions: 1, Patch: "@@ -1 +1 @@\n+x", ContentComplete: true}}
+	got := reviewer.Review(in)
+	if got.Action != PullRequestRouteToHuman || len(agent.seen) != 0 {
+		t.Fatalf("got %s after %d agent calls", got.Action, len(agent.seen))
+	}
+}
+
+func TestChunkedReview(t *testing.T) {
+	policy := findingsPolicy(PullRequestModeShadow)
+	policy.ReviewChunkChars = 1000
+	agent := &recordingAgent{result: structuralVerdict()}
+	reviewer, err := NewPullRequestReviewer(policy, fixedScorer(0), agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := largeFeatureInput(5) // each patch is ~620 characters
+	got := reviewer.Review(in)
+	if got.Action != PullRequestWouldApprove {
+		t.Fatalf("got %s; stages %+v", got.Action, got.Stages)
+	}
+	if len(agent.seen) != 5 {
+		t.Fatalf("agent calls = %d, want one per part", len(agent.seen))
+	}
+	files := map[string]bool{}
+	for _, part := range agent.seen {
+		if part.Parts != 5 || !strings.Contains(renderDiffForReview(part), fmt.Sprintf("part %d of 5", part.Part)) {
+			t.Fatalf("part %d/%d not announced", part.Part, part.Parts)
+		}
+		for _, c := range part.Changes {
+			files[c.File] = true
+		}
+	}
+	if len(files) != 5 {
+		t.Fatalf("parts covered %d files, want 5", len(files))
+	}
+}
+
+func TestChunkedReviewBlocksWhenAnyPartBlocks(t *testing.T) {
+	results := []ACRResult{
+		{Confidence: 10, Accept: true, ReviewedFiles: []string{"a"}, Summary: "ok"},
+		{Confidence: 9, ReviewedFiles: []string{"b"}, Findings: []ReviewFinding{{Severity: "P1", Title: "t", Summary: "s"}}, Summary: "bug"},
+	}
+	merged := mergeVerdicts(results, func(i int) string { return fmt.Sprint(i) })
+	if merged.Accept || merged.Confidence != 9 || len(merged.Findings) != 1 || len(merged.ReviewedFiles) != 2 {
+		t.Fatalf("merged = %+v", merged)
+	}
+}
+
+func TestChunkedReviewFileOverBudgetFailsSafe(t *testing.T) {
+	policy := findingsPolicy(PullRequestModeShadow)
+	policy.ReviewChunkChars = 100
+	agent := &recordingAgent{result: structuralVerdict()}
+	reviewer, err := NewPullRequestReviewer(policy, fixedScorer(0), agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := reviewer.Review(largeFeatureInput(1))
+	if got.Action != PullRequestRouteToHuman || len(agent.seen) != 0 || !strings.Contains(got.Agent.Summary, "over the 100-character review budget") {
+		t.Fatalf("got %s summary=%q calls=%d", got.Action, got.Agent.Summary, len(agent.seen))
+	}
+}

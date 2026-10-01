@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // PullRequestMode controls whether a safe result is reported or may be acted on.
@@ -61,7 +62,32 @@ type PullRequestInput struct {
 	ChangesRequested        bool              `json:"changes_requested"`
 	StaleApprovalsDismissed bool              `json:"stale_approvals_dismissed"`
 	Files                   []PullRequestFile `json:"files"`
+	// Stack lists the open pull requests this one is stacked on, nearest
+	// first: Stack[0].HeadRef is BaseRef, and the last entry's BaseRef is the
+	// branch the stack ultimately merges into. Empty for an unstacked PR.
+	Stack []PullRequestStackEntry `json:"stack,omitempty"`
 }
+
+// PullRequestStackEntry is one open pull request below another in a stack.
+type PullRequestStackEntry struct {
+	Number  int    `json:"number"`
+	HeadRef string `json:"head_ref"`
+	HeadSHA string `json:"head_sha"`
+	BaseRef string `json:"base_ref"`
+}
+
+// PullRequestApprovalBasis selects what makes a pull request approvable.
+type PullRequestApprovalBasis string
+
+const (
+	// ApprovalBasisAllowRules requires an allow rule, the global size limits
+	// and the risk threshold, then a maximally confident safe review.
+	ApprovalBasisAllowRules PullRequestApprovalBasis = "allow-rules"
+	// ApprovalBasisReviewFindings rests the verdict on the review agents'
+	// findings: no size limits, allow rules or risk gate, and no requirement
+	// that the change be one of the safe-signal kinds.
+	ApprovalBasisReviewFindings PullRequestApprovalBasis = "review-findings"
+)
 
 // PullRequestPathRule names one complete, low-risk class. Every changed file
 // must match an include and no exclusion for the rule to apply.
@@ -95,6 +121,20 @@ type PullRequestPolicy struct {
 	// an approval. Empty means P0, P1 and P2, the original criterion. It must
 	// always include P0 and P1.
 	BlockingFindingSeverities []string `json:"blocking_finding_severities,omitempty"`
+	// ApprovalBasis defaults to allow-rules.
+	ApprovalBasis PullRequestApprovalBasis `json:"approval_basis,omitempty"`
+	// RequiredReviewers is how many review agents must each pass; default 1.
+	RequiredReviewers int `json:"required_reviewers,omitempty"`
+	// AllowStacked admits a pull request based on another open pull request's
+	// head branch when the stack bottoms out on an allowed base branch. A
+	// stacked pull request is never approved, only marked would-approve: its
+	// verdict covers its own delta, not the changes below it.
+	AllowStacked bool `json:"allow_stacked,omitempty"`
+	// GeneratedFiles withholds generated files from the review agents.
+	GeneratedFiles *PullRequestGeneratedFiles `json:"generated_files,omitempty"`
+	// ReviewChunkChars caps the patch text sent in one review request; larger
+	// diffs are reviewed in several. Zero means defaultReviewChunkChars.
+	ReviewChunkChars int `json:"review_chunk_chars,omitempty"`
 }
 
 // PullRequestReview is a strict, machine-readable decision bound to one head.
@@ -111,9 +151,28 @@ type PullRequestReview struct {
 	RiskPercentile float64           `json:"risk_percentile"`
 	// Reviewer names the ACR provider and model that produced Agent, e.g.
 	// "openai/gpt-4o-mini" or "fireworks/accounts/fireworks/models/glm-5p3".
-	Reviewer string        `json:"reviewer,omitempty"`
-	Agent    ACRResult     `json:"agent"`
-	Stages   []StageResult `json:"stages"`
+	// With several reviewers it joins their names with "+", and Agent is the
+	// conservative merge of their verdicts; Reviews holds each one.
+	Reviewer      string                       `json:"reviewer,omitempty"`
+	Agent         ACRResult                    `json:"agent"`
+	Reviews       []PullRequestReviewerVerdict `json:"reviews,omitempty"`
+	ApprovalBasis PullRequestApprovalBasis     `json:"approval_basis"`
+	Stack         []PullRequestStackEntry      `json:"stack,omitempty"`
+	// Withheld are the generated files the agents saw only by name.
+	Withheld []GeneratedFile `json:"withheld,omitempty"`
+	// GeneratedUnlisted are reviewed files whose generated-code header the
+	// change itself adds, outside every configured generated path.
+	GeneratedUnlisted []string      `json:"generated_unlisted,omitempty"`
+	Stages            []StageResult `json:"stages"`
+}
+
+// PullRequestReviewerVerdict is one review agent's verdict and whether it met
+// the policy's bar.
+type PullRequestReviewerVerdict struct {
+	Reviewer string    `json:"reviewer"`
+	Passed   bool      `json:"passed"`
+	Reason   string    `json:"reason"`
+	Agent    ACRResult `json:"agent"`
 }
 
 // PullRequestReviewer applies a policy with pluggable Radar scoring and review.
@@ -121,26 +180,75 @@ type PullRequestReviewer struct {
 	policy     PullRequestPolicy
 	scorer     RiskScorer
 	calibrator *Calibrator
-	agent      ReviewAgent
+	agents     []ReviewAgent
+	generated  generatedMatcher
 }
 
-// NewPullRequestReviewer validates policy and constructs a generic PR reviewer.
-func NewPullRequestReviewer(policy PullRequestPolicy, scorer RiskScorer, agent ReviewAgent) (*PullRequestReviewer, error) {
+// NewPullRequestReviewer validates policy and constructs a generic PR
+// reviewer. With several agents, each must pass on its own.
+func NewPullRequestReviewer(policy PullRequestPolicy, scorer RiskScorer, agents ...ReviewAgent) (*PullRequestReviewer, error) {
 	if err := policy.Validate(); err != nil {
 		return nil, err
 	}
 	if scorer == nil {
 		return nil, fmt.Errorf("radar: pull request scorer is required")
 	}
-	if agent == nil {
+	if len(agents) == 0 {
 		return nil, fmt.Errorf("radar: pull request review agent is required")
 	}
-	return &PullRequestReviewer{
+	for _, agent := range agents {
+		if agent == nil {
+			return nil, fmt.Errorf("radar: pull request review agent is required")
+		}
+	}
+	if len(agents) < policy.requiredReviewers() {
+		return nil, fmt.Errorf("radar: policy requires %d reviewers, got %d", policy.requiredReviewers(), len(agents))
+	}
+	r := &PullRequestReviewer{
 		policy:     policy,
 		scorer:     scorer,
 		calibrator: NewCalibrator(policy.CalibrationSample),
-		agent:      agent,
-	}, nil
+		agents:     agents,
+	}
+	if policy.GeneratedFiles != nil {
+		r.generated = newGeneratedMatcher(*policy.GeneratedFiles, nil)
+	}
+	return r, nil
+}
+
+// UseGitattributes adds the linguist-generated paths of a trusted
+// .gitattributes file to the policy's generated paths.
+func (r *PullRequestReviewer) UseGitattributes(data []byte) error {
+	if r.policy.GeneratedFiles == nil {
+		return fmt.Errorf("radar: policy has no generated_files block")
+	}
+	paths, err := ParseGitattributesGenerated(data)
+	if err != nil {
+		return err
+	}
+	r.generated = newGeneratedMatcher(*r.policy.GeneratedFiles, paths)
+	return nil
+}
+
+func (p PullRequestPolicy) basis() PullRequestApprovalBasis {
+	if p.ApprovalBasis == "" {
+		return ApprovalBasisAllowRules
+	}
+	return p.ApprovalBasis
+}
+
+func (p PullRequestPolicy) requiredReviewers() int {
+	if p.RequiredReviewers <= 0 {
+		return 1
+	}
+	return p.RequiredReviewers
+}
+
+func (p PullRequestPolicy) reviewChunkChars() int {
+	if p.ReviewChunkChars <= 0 {
+		return defaultReviewChunkChars
+	}
+	return p.ReviewChunkChars
 }
 
 // Validate rejects policies that could silently broaden automation.
@@ -154,11 +262,29 @@ func (p PullRequestPolicy) Validate() error {
 	if len(p.AllowedBaseBranches) == 0 {
 		return fmt.Errorf("radar: at least one allowed base branch is required")
 	}
-	if len(p.AllowRules) == 0 {
-		return fmt.Errorf("radar: at least one allow rule is required")
+	switch p.basis() {
+	case ApprovalBasisAllowRules:
+		if len(p.AllowRules) == 0 {
+			return fmt.Errorf("radar: at least one allow rule is required")
+		}
+		if p.MaxFiles <= 0 || p.MaxChangedLines <= 0 {
+			return fmt.Errorf("radar: positive global file and line limits are required")
+		}
+	case ApprovalBasisReviewFindings:
+		// Limits that would be ignored must not look as if they apply.
+		if len(p.AllowRules) > 0 || p.MaxFiles != 0 || p.MaxChangedLines != 0 {
+			return fmt.Errorf("radar: approval basis review-findings takes no allow rules or global file and line limits")
+		}
+	default:
+		return fmt.Errorf("radar: approval basis must be allow-rules or review-findings")
 	}
-	if p.MaxFiles <= 0 || p.MaxChangedLines <= 0 {
-		return fmt.Errorf("radar: positive global file and line limits are required")
+	if p.RequiredReviewers < 0 || p.ReviewChunkChars < 0 {
+		return fmt.Errorf("radar: required reviewers and review chunk size cannot be negative")
+	}
+	if p.GeneratedFiles != nil {
+		if err := p.GeneratedFiles.validate(); err != nil {
+			return err
+		}
 	}
 	if p.MaxRiskPercentile < 0 || p.MaxRiskPercentile > 100 {
 		return fmt.Errorf("radar: max risk percentile must be between 0 and 100")
@@ -227,7 +353,9 @@ func (r *PullRequestReviewer) Review(in PullRequestInput) PullRequestReview {
 		Mode:           r.policy.Mode,
 		Action:         PullRequestRouteToHuman,
 		RiskPercentile: -1,
-		Reviewer:       describeReviewAgent(r.agent),
+		Reviewer:       r.describeReviewers(),
+		ApprovalBasis:  r.policy.basis(),
+		Stack:          in.Stack,
 	}
 	add := func(name string, passed bool, reason string) bool {
 		out.Stages = append(out.Stages, StageResult{Name: name, Passed: passed, Reason: reason})
@@ -246,11 +374,14 @@ func (r *PullRequestReviewer) Review(in PullRequestInput) PullRequestReview {
 	denied, denyReason := pullRequestDenied(r.policy, in)
 	add("pr.deny-policy", !denied, denyReason)
 
-	rule, allowReason := matchPullRequestRule(r.policy, in)
-	allowlisted := rule != nil
-	add("pr.allow-rule", allowlisted, allowReason)
-	if rule != nil {
-		out.MatchedRule = rule.Name
+	allowlisted := true
+	if r.policy.basis() == ApprovalBasisAllowRules {
+		rule, allowReason := matchPullRequestRule(r.policy, in)
+		allowlisted = rule != nil
+		add("pr.allow-rule", allowlisted, allowReason)
+		if rule != nil {
+			out.MatchedRule = rule.Name
+		}
 	}
 
 	out.RawRiskScore = r.scorer.Score(diff)
@@ -259,34 +390,148 @@ func (r *PullRequestReviewer) Review(in PullRequestInput) PullRequestReview {
 		return out
 	}
 	out.RiskPercentile = r.calibrator.Percentile(out.RawRiskScore)
-	riskPassed := out.RiskPercentile <= r.policy.MaxRiskPercentile
-	add("pr.risk-threshold", riskPassed,
-		fmt.Sprintf("risk percentile %.1f vs threshold P%.1f", out.RiskPercentile, r.policy.MaxRiskPercentile))
+	riskPassed := true
+	if r.policy.basis() == ApprovalBasisAllowRules {
+		riskPassed = out.RiskPercentile <= r.policy.MaxRiskPercentile
+		add("pr.risk-threshold", riskPassed,
+			fmt.Sprintf("risk percentile %.1f vs threshold P%.1f", out.RiskPercentile, r.policy.MaxRiskPercentile))
+	} else {
+		// The heuristic score grows with line count, so gating on it would
+		// reintroduce the size limit this basis drops.
+		add("pr.risk-score", true, fmt.Sprintf("risk percentile %.1f recorded, not gating under review-findings", out.RiskPercentile))
+	}
 
-	out.Agent = r.agent.Review(diff)
-	blocking := r.policy.blockingSeverities()
-	claimed := out.Agent.Accept || out.Agent.ModelAccept
-	agentPassed := claimed && out.Agent.Confidence >= r.policy.MinReviewConfidence &&
-		len(out.Agent.RiskSignals) == 0 && len(out.Agent.SafeSignals) > 0 &&
-		reviewCoversDiff(out.Agent, diff) && !hasBlockingFinding(out.Agent.Findings, blocking)
-	add("pr.review-agent", agentPassed,
-		fmt.Sprintf("accept=%t confidence=%d/%d risk-signals=%d reviewed-files=%d/%d blocking-findings(%s)=%t: %s",
-			claimed, out.Agent.Confidence, r.policy.MinReviewConfidence, len(out.Agent.RiskSignals),
-			len(out.Agent.ReviewedFiles), len(diff.Changes), strings.Join(blocking, ","), hasBlockingFinding(out.Agent.Findings, blocking), out.Agent.Summary))
+	reviewDiff := r.reviewableDiff(diff, in)
+	out.Withheld = reviewDiff.Withheld
+	for _, f := range in.Files {
+		if _, unlisted := r.generated.classify(f); unlisted {
+			out.GeneratedUnlisted = append(out.GeneratedUnlisted, f.Path)
+		}
+	}
+	agentPassed := false
+	if len(reviewDiff.Changes) == 0 {
+		add("pr.review-agent", false, fmt.Sprintf("all %d changed files are generated; nothing for the review agents to assess", len(out.Withheld)))
+	} else {
+		agentPassed = r.runReviewers(&out, reviewDiff, add)
+	}
 
 	out.Eligible = !denied && allowlisted && riskPassed
-	if out.Eligible && agentPassed {
-		if r.policy.Mode == PullRequestModeApprove {
-			out.Action = PullRequestApprove
-		} else {
-			out.Action = PullRequestWouldApprove
-		}
-		return out
-	}
-	if !denied && !out.Eligible && agentPassed {
+	switch {
+	case out.Eligible && agentPassed && len(in.Stack) > 0:
+		add("pr.stack", true, fmt.Sprintf("stacked on #%d; the verdict covers this pull request's own changes only", in.Stack[0].Number))
+		out.Action = PullRequestWouldApprove
+	case out.Eligible && agentPassed && r.policy.Mode == PullRequestModeApprove:
+		out.Action = PullRequestApprove
+	case out.Eligible && agentPassed:
+		out.Action = PullRequestWouldApprove
+	case !denied && !out.Eligible && agentPassed:
 		out.Action = PullRequestPolicyCandidate
 	}
 	return out
+}
+
+// reviewableDiff withholds generated files from what the agents see.
+func (r *PullRequestReviewer) reviewableDiff(diff Diff, in PullRequestInput) Diff {
+	out := diff
+	out.Changes = nil
+	for i, f := range in.Files {
+		if reason, _ := r.generated.classify(f); reason != "" {
+			out.Withheld = append(out.Withheld, GeneratedFile{
+				Path: f.Path, Status: f.Status, Additions: f.Additions, Deletions: f.Deletions, Reason: reason,
+			})
+			continue
+		}
+		out.Changes = append(out.Changes, diff.Changes[i])
+	}
+	if len(out.Withheld) > 0 && r.policy.GeneratedFiles != nil && r.policy.GeneratedFiles.Note != "" {
+		out.ReviewNotes = append(out.ReviewNotes, r.policy.GeneratedFiles.Note)
+	}
+	return out
+}
+
+// runReviewers runs every agent concurrently and records each verdict. It
+// passes only when every agent passes.
+func (r *PullRequestReviewer) runReviewers(out *PullRequestReview, diff Diff, add func(string, bool, string) bool) bool {
+	results := make([]ACRResult, len(r.agents))
+	var wg sync.WaitGroup
+	for i, agent := range r.agents {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i] = reviewInChunks(agent, diff, r.policy.reviewChunkChars())
+		}()
+	}
+	wg.Wait()
+
+	passed := 0
+	for i, res := range results {
+		ok, reason := r.reviewerPasses(res, diff)
+		if ok {
+			passed++
+		}
+		out.Reviews = append(out.Reviews, PullRequestReviewerVerdict{
+			Reviewer: describeReviewAgent(r.agents[i]), Passed: ok, Reason: reason, Agent: res,
+		})
+	}
+	if len(results) == 1 {
+		out.Agent = results[0]
+		reason := out.Reviews[0].Reason
+		out.Reviews = nil
+		return add("pr.review-agent", passed == 1, reason)
+	}
+	out.Agent = mergeVerdicts(results, func(i int) string { return describeReviewAgent(r.agents[i]) })
+	for _, review := range out.Reviews {
+		add("pr.review-agent", review.Passed, review.Reviewer+": "+review.Reason)
+	}
+	return add("pr.review-consensus", passed == len(results),
+		fmt.Sprintf("%d of %d reviewers passed; every reviewer must", passed, len(results)))
+}
+
+// defectSignals are the risk signals that describe a likely problem rather
+// than the change's size or shape; only they block under review-findings.
+var defectSignals = map[ChangeSignal]bool{
+	SignalBugOrLogicError: true,
+	SignalPerformanceRisk: true,
+	SignalSecretsExposure: true,
+	SignalSQLInjection:    true,
+	SignalAuthBypass:      true,
+}
+
+func (r *PullRequestReviewer) reviewerPasses(res ACRResult, diff Diff) (bool, string) {
+	blocking := r.policy.blockingSeverities()
+	hasBlocking := hasBlockingFinding(res.Findings, blocking)
+	covered := reviewCoversDiff(res, diff)
+	confident := res.Confidence >= r.policy.MinReviewConfidence
+	var passed bool
+	var detail string
+	switch r.policy.basis() {
+	case ApprovalBasisReviewFindings:
+		var defects []string
+		for _, s := range res.RiskSignals {
+			if defectSignals[s] {
+				defects = append(defects, string(s))
+			}
+		}
+		// A decline must be explained by a recorded signal or finding; one
+		// with neither is a concern the reviewer left unstated.
+		explained := res.ModelAccept || res.Accept || len(res.RiskSignals) > 0 || len(res.Findings) > 0
+		passed = confident && covered && !hasBlocking && len(defects) == 0 && explained
+		detail = fmt.Sprintf("confidence=%d/%d defect-signals=%v declined-unexplained=%t", res.Confidence, r.policy.MinReviewConfidence, defects, !explained)
+	default:
+		claimed := res.Accept || res.ModelAccept
+		passed = claimed && confident && len(res.RiskSignals) == 0 && len(res.SafeSignals) > 0 && covered && !hasBlocking
+		detail = fmt.Sprintf("accept=%t confidence=%d/%d risk-signals=%d", claimed, res.Confidence, r.policy.MinReviewConfidence, len(res.RiskSignals))
+	}
+	return passed, fmt.Sprintf("%s reviewed-files=%d/%d blocking-findings(%s)=%t: %s",
+		detail, len(res.ReviewedFiles), len(diff.Changes), strings.Join(blocking, ","), hasBlocking, res.Summary)
+}
+
+func (r *PullRequestReviewer) describeReviewers() string {
+	names := make([]string, 0, len(r.agents))
+	for _, agent := range r.agents {
+		names = append(names, describeReviewAgent(agent))
+	}
+	return strings.Join(names, "+")
 }
 
 func reviewCoversDiff(result ACRResult, diff Diff) bool {
@@ -341,8 +586,10 @@ func reviewStateGate(policy PullRequestPolicy, in PullRequestInput) (bool, strin
 		return false, "pull request is a draft"
 	case !in.SameRepository:
 		return false, "cross-repository pull requests are not eligible"
-	case !matchesAnyPath(in.BaseRef, policy.AllowedBaseBranches):
+	case !matchesAnyPath(in.BaseRef, policy.AllowedBaseBranches) && len(in.Stack) == 0:
 		return false, "base branch is not allowed"
+	case len(in.Stack) > 0 && !policy.AllowStacked:
+		return false, "stacked pull requests are not enabled by policy"
 	case !in.ChecksObserved:
 		return false, "no checks were observed"
 	case strings.TrimSpace(in.CheckFingerprint) == "":
@@ -358,7 +605,37 @@ func reviewStateGate(policy PullRequestPolicy, in PullRequestInput) (bool, strin
 	case policy.Mode == PullRequestModeApprove && !in.StaleApprovalsDismissed:
 		return false, "approval mode requires stale approvals to be dismissed"
 	}
+	if len(in.Stack) > 0 {
+		if err := validateStack(policy, in); err != nil {
+			return false, err.Error()
+		}
+		root := in.Stack[len(in.Stack)-1].BaseRef
+		return true, fmt.Sprintf("pull request state is eligible; stacked %d deep on %s", len(in.Stack), root)
+	}
 	return true, "pull request state is eligible"
+}
+
+// validateStack checks the stack is a chain of distinct open pull requests
+// from this one's base down to an allowed base branch.
+func validateStack(policy PullRequestPolicy, in PullRequestInput) error {
+	want := in.BaseRef
+	seen := map[int]bool{in.Number: true}
+	for _, entry := range in.Stack {
+		switch {
+		case entry.Number <= 0 || seen[entry.Number]:
+			return fmt.Errorf("stack repeats or omits a pull request number")
+		case entry.HeadRef != want:
+			return fmt.Errorf("stack is broken: expected #%d to have head %s, found %s", entry.Number, want, entry.HeadRef)
+		case strings.TrimSpace(entry.HeadSHA) == "":
+			return fmt.Errorf("stack entry #%d has no head SHA", entry.Number)
+		}
+		seen[entry.Number] = true
+		want = entry.BaseRef
+	}
+	if !matchesAnyPath(want, policy.AllowedBaseBranches) {
+		return fmt.Errorf("stack bottoms out on %s, which is not an allowed base branch", want)
+	}
+	return nil
 }
 
 func pullRequestDiff(in PullRequestInput) (Diff, bool, string) {
@@ -472,6 +749,9 @@ func validateRepositoryPath(value string) error {
 	}
 	return nil
 }
+
+// MatchesPathGlob reports whether value matches any of Radar's path globs.
+func MatchesPathGlob(value string, patterns []string) bool { return matchesAnyPath(value, patterns) }
 
 func matchesAnyPath(value string, patterns []string) bool {
 	for _, pattern := range patterns {

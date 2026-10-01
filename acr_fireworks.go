@@ -61,11 +61,17 @@ const (
 // ($FIREWORKS_API_KEY, $RADAR_ACR_MODEL, optional $FIREWORKS_BASE_URL and
 // $RADAR_ACR_MAX_TOKENS). It errors if the key or the model is missing.
 func NewFireworksAgent() (*FireworksAgent, error) {
+	return NewFireworksAgentForModel(os.Getenv("RADAR_ACR_MODEL"))
+}
+
+// NewFireworksAgentForModel is NewFireworksAgent with the model given rather
+// than read from $RADAR_ACR_MODEL.
+func NewFireworksAgentForModel(model string) (*FireworksAgent, error) {
 	key := os.Getenv("FIREWORKS_API_KEY")
 	if key == "" {
 		return nil, fmt.Errorf("radar: FIREWORKS_API_KEY not set")
 	}
-	model := strings.TrimSpace(os.Getenv("RADAR_ACR_MODEL"))
+	model = strings.TrimSpace(model)
 	if model == "" {
 		return nil, fmt.Errorf("radar: RADAR_ACR_MODEL is required for the fireworks agent (full id, e.g. accounts/fireworks/models/glm-5p3)")
 	}
