@@ -14,7 +14,6 @@ import (
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/bedrock"
-	"github.com/anthropics/anthropic-sdk-go/option"
 	"github.com/travisjeffery/radar"
 )
 
@@ -41,6 +40,8 @@ type Agent struct {
 	Effort    anthropic.OutputConfigEffort
 	Timeout   time.Duration
 	client    anthropic.Client
+	// send replaces the Bedrock call in tests.
+	send func(context.Context, anthropic.MessageNewParams) (anthropic.Message, error)
 }
 
 // NewAgent builds an agent from the AWS default credential chain and region
@@ -90,18 +91,57 @@ func (a *Agent) Review(d radar.Diff) radar.ACRResult {
 	return res
 }
 
-func (a *Agent) review(ctx context.Context, d radar.Diff, opts ...option.RequestOption) radar.ACRResult {
-	stream := a.client.Messages.NewStreaming(ctx, a.params(d), opts...)
+// review asks once more when the model returns a malformed verdict, which
+// happens in a few percent of reviews without a strict schema. Errors,
+// refusals and truncation are not retried.
+func (a *Agent) review(ctx context.Context, d radar.Diff) radar.ACRResult {
+	send := a.send
+	if send == nil {
+		send = a.stream
+	}
+	var usage *radar.ReviewUsage
+	var res radar.ACRResult
+	for attempt := 0; attempt < 2; attempt++ {
+		msg, err := send(ctx, a.params(d))
+		if err != nil {
+			res = failSafe(err, nil)
+			break
+		}
+		var malformed bool
+		res, malformed = verdictFrom(msg)
+		usage = addUsage(usage, res.Usage)
+		if !malformed {
+			break
+		}
+	}
+	res.Usage = usage
+	return res
+}
+
+func (a *Agent) stream(ctx context.Context, params anthropic.MessageNewParams) (anthropic.Message, error) {
+	stream := a.client.Messages.NewStreaming(ctx, params)
 	var msg anthropic.Message
 	for stream.Next() {
 		if err := msg.Accumulate(stream.Current()); err != nil {
-			return failSafe(fmt.Errorf("reading stream: %w", err), nil)
+			return msg, fmt.Errorf("reading stream: %w", err)
 		}
 	}
-	if err := stream.Err(); err != nil {
-		return failSafe(err, nil)
+	return msg, stream.Err()
+}
+
+func addUsage(total, u *radar.ReviewUsage) *radar.ReviewUsage {
+	if u == nil {
+		return total
 	}
-	return verdictFrom(msg)
+	if total == nil {
+		total = &radar.ReviewUsage{}
+	}
+	total.InputTokens += u.InputTokens
+	total.OutputTokens += u.OutputTokens
+	total.CacheReadTokens += u.CacheReadTokens
+	total.CacheWriteTokens += u.CacheWriteTokens
+	total.Requests += u.Requests
+	return total
 }
 
 func (a *Agent) params(d radar.Diff) anthropic.MessageNewParams {
@@ -134,8 +174,9 @@ func requiredOf(schema map[string]any) []string {
 	return required
 }
 
-// verdictFrom turns a finished response into a verdict.
-func verdictFrom(msg anthropic.Message) radar.ACRResult {
+// verdictFrom turns a finished response into a verdict, reporting whether
+// the model's output was malformed (and so worth asking again).
+func verdictFrom(msg anthropic.Message) (radar.ACRResult, bool) {
 	usage := &radar.ReviewUsage{
 		InputTokens:      msg.Usage.InputTokens,
 		OutputTokens:     msg.Usage.OutputTokens,
@@ -147,9 +188,9 @@ func verdictFrom(msg anthropic.Message) radar.ACRResult {
 	case anthropic.StopReasonMaxTokens:
 		res := failSafe(fmt.Errorf("response truncated at max_tokens"), usage)
 		res.Truncated = true
-		return res
+		return res, false
 	case anthropic.StopReasonRefusal:
-		return failSafe(fmt.Errorf("model refused the review"), usage)
+		return failSafe(fmt.Errorf("model refused the review"), usage), false
 	}
 	var calls []json.RawMessage
 	for _, block := range msg.Content {
@@ -158,14 +199,21 @@ func verdictFrom(msg anthropic.Message) radar.ACRResult {
 		}
 	}
 	if len(calls) != 1 {
-		return failSafe(fmt.Errorf("expected one %s call, got %d (stop %s)", verdictTool, len(calls), msg.StopReason), usage)
+		return failSafe(fmt.Errorf("expected one %s call, got %d (stop %s)", verdictTool, len(calls), msg.StopReason), usage), true
 	}
 	res, err := radar.ParseACRVerdict(string(unwrapVerdict(calls[0])))
 	if err != nil {
-		return failSafe(fmt.Errorf("parsing verdict: %w", err), usage)
+		return failSafe(fmt.Errorf("parsing verdict: %w; input %s", err, clip(string(calls[0]), 300)), usage), true
 	}
 	res.Usage = usage
-	return res
+	return res, false
+}
+
+func clip(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 // unwrapVerdict undoes two shapes the model sometimes produces without a

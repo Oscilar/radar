@@ -1,6 +1,7 @@
 package bedrock
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -50,7 +51,7 @@ func TestVerdictFrom(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := verdictFrom(message(t, tt.stop, tt.content))
+			got, _ := verdictFrom(message(t, tt.stop, tt.content))
 			if got.Usage == nil || got.Usage.InputTokens != 2255 || got.Usage.OutputTokens != 246 || got.Usage.Requests != 1 {
 				t.Fatalf("usage = %+v", got.Usage)
 			}
@@ -97,5 +98,38 @@ func TestParamsAvoidFieldsBedrockRejects(t *testing.T) {
 	schema := tool["input_schema"].(map[string]any)
 	if schema["additionalProperties"] != false || len(schema["required"].([]any)) != 7 {
 		t.Fatalf("input schema = %v", schema)
+	}
+}
+
+func TestReviewRetriesOnceOnMalformedVerdict(t *testing.T) {
+	bad := toolUse(`{"accept":true,"confidence":9,"risk_signals":[],"safe_signals":[],"reviewed_files":["a"],"findings":[{"severity":"P2","title":"","summary":""}],"summary":"s"}`)
+	tests := []struct {
+		name      string
+		responses []string
+		stops     []string
+		wantCalls int
+		wantPass  bool
+	}{
+		{name: "second answer is good", responses: []string{bad, toolUse(verdictJSON)}, stops: []string{"tool_use", "tool_use"}, wantCalls: 2, wantPass: true},
+		{name: "two bad answers fail safe", responses: []string{bad, bad}, stops: []string{"tool_use", "tool_use"}, wantCalls: 2},
+		{name: "truncation is not retried", responses: []string{`{"type":"text","text":"x"}`}, stops: []string{"max_tokens"}, wantCalls: 1},
+		{name: "refusal is not retried", responses: []string{`{"type":"text","text":""}`}, stops: []string{"refusal"}, wantCalls: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls := 0
+			a := &Agent{Model: "m", MaxTokens: 1000, send: func(context.Context, anthropic.MessageNewParams) (anthropic.Message, error) {
+				i := min(calls, len(tt.responses)-1)
+				calls++
+				return message(t, tt.stops[i], tt.responses[i]), nil
+			}}
+			got := a.review(context.Background(), radar.Diff{})
+			if calls != tt.wantCalls || got.Accept != tt.wantPass || got.Usage == nil || got.Usage.Requests != calls {
+				t.Fatalf("calls=%d accept=%t usage=%+v summary=%q", calls, got.Accept, got.Usage, got.Summary)
+			}
+			if !tt.wantPass && tt.wantCalls == 2 && !strings.Contains(got.Summary, "input {") {
+				t.Fatalf("a malformed verdict must be recorded for diagnosis: %q", got.Summary)
+			}
+		})
 	}
 }
