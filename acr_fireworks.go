@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -132,7 +133,11 @@ type fireworksJSONSchema struct {
 }
 
 type fireworksChatResp struct {
-	Model   string `json:"model"`
+	Model string `json:"model"`
+	Usage *struct {
+		PromptTokens     int64 `json:"prompt_tokens"`
+		CompletionTokens int64 `json:"completion_tokens"`
+	} `json:"usage"`
 	Choices []struct {
 		FinishReason string `json:"finish_reason"`
 		Message      struct {
@@ -157,7 +162,9 @@ func (a *FireworksAgent) Review(d Diff) ACRResult {
 	start := time.Now()
 	res, err := a.review(ctx, d)
 	if err != nil {
-		res = ACRResult{Accept: false, Confidence: 0, Summary: "ACR Fireworks error, failing safe: " + err.Error()}
+		usage := res.Usage
+		res = ACRResult{Accept: false, Confidence: 0, Summary: "ACR Fireworks error, failing safe: " + err.Error(), Usage: usage}
+		res.Truncated = errors.Is(err, errTruncated)
 	}
 	elapsed := time.Since(start).Milliseconds()
 	res.ElapsedMS = &elapsed
@@ -223,6 +230,10 @@ func (a *FireworksAgent) review(ctx context.Context, d Diff) (ACRResult, error) 
 	if err := json.Unmarshal(body, &fr); err != nil {
 		return ACRResult{}, err
 	}
+	var usage *ReviewUsage
+	if fr.Usage != nil {
+		usage = &ReviewUsage{InputTokens: fr.Usage.PromptTokens, OutputTokens: fr.Usage.CompletionTokens, Requests: 1}
+	}
 	if fr.Error != nil {
 		return ACRResult{}, fmt.Errorf("fireworks API error: %s", fr.Error.Message)
 	}
@@ -238,7 +249,7 @@ func (a *FireworksAgent) review(ctx context.Context, d Diff) (ACRResult, error) 
 	switch choice.FinishReason {
 	case "stop":
 	case "length":
-		return ACRResult{}, fmt.Errorf("fireworks response truncated at max_tokens=%d", maxTokens)
+		return ACRResult{Usage: usage}, fmt.Errorf("%w at max_tokens=%d", errTruncated, maxTokens)
 	default:
 		// Includes a missing finish_reason: without an explicit stop the
 		// completion cannot be shown to be complete.
@@ -251,8 +262,12 @@ func (a *FireworksAgent) review(ctx context.Context, d Diff) (ACRResult, error) 
 		}
 		return ACRResult{}, fmt.Errorf("fireworks API returned no content")
 	}
-	return parseACRVerdict(text)
+	res, err := parseACRVerdict(text)
+	res.Usage = usage
+	return res, err
 }
+
+var errTruncated = errors.New("fireworks response truncated")
 
 // stripThinkBlock removes a leading <think>…</think> block. Fireworks normally
 // returns reasoning in a separate reasoning_content field, but some open-weight

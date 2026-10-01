@@ -555,7 +555,7 @@ var defectSignals = map[ChangeSignal]bool{
 func (r *PullRequestReviewer) reviewerPasses(res ACRResult, diff Diff) (bool, string) {
 	blocking := r.policy.blockingSeverities()
 	hasBlocking := hasBlockingFinding(res.Findings, blocking)
-	covered := reviewCoversDiff(res, diff)
+	covered := reviewCoversDiff(res, diff) && !res.Truncated
 	confident := res.Confidence >= r.policy.MinReviewConfidence
 	var passed bool
 	var detail string

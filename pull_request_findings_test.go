@@ -563,3 +563,80 @@ func TestChunkedReviewFileOverBudgetFailsSafe(t *testing.T) {
 		t.Fatalf("got %s summary=%q calls=%d", got.Action, got.Agent.Summary, len(agent.seen))
 	}
 }
+
+// truncatingAgent reports truncation for any part with more than limit
+// characters of patch, the way a model that runs out of output does.
+type truncatingAgent struct {
+	recordingAgent
+	limit int
+}
+
+func (a *truncatingAgent) Review(d Diff) ACRResult {
+	size := 0
+	for _, c := range d.Changes {
+		size += len(c.Content)
+	}
+	res := a.recordingAgent.Review(d)
+	if size > a.limit {
+		return ACRResult{Summary: "truncated", Truncated: true, Usage: &ReviewUsage{OutputTokens: 100, Requests: 1}}
+	}
+	res.Usage = &ReviewUsage{OutputTokens: 10, Requests: 1}
+	return res
+}
+
+func TestTruncatedPartIsReviewedInHalves(t *testing.T) {
+	agent := &truncatingAgent{recordingAgent: recordingAgent{result: structuralVerdict()}, limit: 13000}
+	reviewer, err := NewPullRequestReviewer(findingsPolicy(PullRequestModeShadow), fixedScorer(0), agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := reviewer.Review(largeFeatureInput(40)) // ~24k characters: one split
+	if got.Action != PullRequestWouldApprove || got.Agent.Truncated {
+		t.Fatalf("got %s truncated=%t; stages %+v", got.Action, got.Agent.Truncated, got.Stages)
+	}
+	if got.Agent.Usage == nil || got.Agent.Usage.Requests != 3 {
+		t.Fatalf("usage must count the truncated attempt and both halves: %+v", got.Agent.Usage)
+	}
+}
+
+func TestTruncationThatNeverFitsFailsSafe(t *testing.T) {
+	agent := &truncatingAgent{recordingAgent: recordingAgent{result: structuralVerdict()}, limit: 10}
+	reviewer, err := NewPullRequestReviewer(findingsPolicy(PullRequestModeShadow), fixedScorer(0), agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := reviewer.Review(largeFeatureInput(40))
+	if got.Action != PullRequestRouteToHuman || !got.Agent.Truncated {
+		t.Fatalf("got %s truncated=%t", got.Action, got.Agent.Truncated)
+	}
+	if n := len(agent.seen); n > 1+2+4+8 {
+		t.Fatalf("splitting must be bounded, made %d calls", n)
+	}
+}
+
+func TestTruncatedVerdictNeverPasses(t *testing.T) {
+	verdict := structuralVerdict()
+	verdict.Truncated = true
+	reviewer, err := NewPullRequestReviewer(findingsPolicy(PullRequestModeShadow), fixedScorer(0), &recordingAgent{result: verdict})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// recordingAgent's verdict covers every file, so only Truncated can block.
+	reviewer.policy.ReviewChunkChars = 1 << 30
+	got := reviewer.Review(largeFeatureInput(1))
+	if got.Action != PullRequestRouteToHuman {
+		t.Fatalf("a truncated verdict must route to human, got %s", got.Action)
+	}
+}
+
+func TestSmallTruncatedPartIsNotSplit(t *testing.T) {
+	agent := &truncatingAgent{recordingAgent: recordingAgent{result: structuralVerdict()}, limit: 10}
+	reviewer, err := NewPullRequestReviewer(findingsPolicy(PullRequestModeShadow), fixedScorer(0), agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := reviewer.Review(largeFeatureInput(2)) // ~1200 characters
+	if got.Action != PullRequestRouteToHuman || len(agent.seen) != 1 {
+		t.Fatalf("a small truncated part must fail safe after one call, got %s after %d calls", got.Action, len(agent.seen))
+	}
+}

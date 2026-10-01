@@ -49,6 +49,16 @@ func chunkDiff(d Diff, budget int) ([]Diff, error) {
 	return out, nil
 }
 
+// maxTruncationSplits bounds how many times a part whose review ran out of
+// output is halved and retried.
+const maxTruncationSplits = 3
+
+// minSplitChars is the smallest part worth halving after a truncation. A
+// small part that still runs out of output is reasoning that will not end,
+// and halving it only multiplies the cost (seen on a 22-line lockfile bump:
+// seven truncated requests).
+const minSplitChars = 16_000
+
 // reviewInChunks runs agent over d, splitting it when it exceeds budget, and
 // merges the parts into one verdict.
 func reviewInChunks(agent ReviewAgent, d Diff, budget int) ACRResult {
@@ -57,7 +67,7 @@ func reviewInChunks(agent ReviewAgent, d Diff, budget int) ACRResult {
 		return ACRResult{Summary: "diff not reviewed, failing safe: " + err.Error()}
 	}
 	if len(parts) == 1 {
-		return agent.Review(parts[0])
+		return reviewPart(agent, parts[0], 0)
 	}
 	start := time.Now()
 	results := make([]ACRResult, len(parts))
@@ -69,7 +79,7 @@ func reviewInChunks(agent ReviewAgent, d Diff, budget int) ACRResult {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			results[i] = agent.Review(part)
+			results[i] = reviewPart(agent, part, 0)
 		}()
 	}
 	wg.Wait()
@@ -77,6 +87,58 @@ func reviewInChunks(agent ReviewAgent, d Diff, budget int) ACRResult {
 	elapsed := time.Since(start).Milliseconds()
 	merged.ElapsedMS = &elapsed
 	return merged
+}
+
+// reviewPart reviews one part and, when the agent ran out of output before
+// finishing, reviews it again as two halves instead of failing.
+func reviewPart(agent ReviewAgent, part Diff, depth int) ACRResult {
+	res := agent.Review(part)
+	if !res.Truncated || depth >= maxTruncationSplits || patchChars(part) < minSplitChars {
+		return res
+	}
+	halves := halveDiff(part)
+	if halves == nil {
+		return res
+	}
+	results := []ACRResult{reviewPart(agent, halves[0], depth+1), reviewPart(agent, halves[1], depth+1)}
+	merged := mergeVerdicts(results, func(i int) string { return fmt.Sprintf("half %d/2", i+1) })
+	merged.Usage = res.Usage.add(merged.Usage)
+	return merged
+}
+
+func patchChars(d Diff) int {
+	n := 0
+	for _, c := range d.Changes {
+		n += len(c.Content)
+	}
+	return n
+}
+
+// halveDiff splits a part's changes into two, or a single change's patch at
+// a hunk or line boundary. It returns nil when there is nothing to split.
+func halveDiff(d Diff) []Diff {
+	note := "This part was too large to review in one response and is split in two; judge only the patches shown."
+	mk := func(changes []Change) Diff {
+		h := d
+		h.Changes = changes
+		h.ReviewNotes = append(append([]string{}, d.ReviewNotes...), note)
+		return h
+	}
+	if len(d.Changes) > 1 {
+		mid := len(d.Changes) / 2
+		return []Diff{mk(d.Changes[:mid]), mk(d.Changes[mid:])}
+	}
+	if len(d.Changes) == 1 {
+		pieces := splitLockfilePatch(d.Changes[0].Content, len(d.Changes[0].Content)/2+1)
+		if len(pieces) < 2 {
+			return nil
+		}
+		first, rest := d.Changes[0], d.Changes[0]
+		first.Content = pieces[0]
+		rest.Content = strings.Join(pieces[1:], "")
+		return []Diff{mk([]Change{first}), mk([]Change{rest})}
+	}
+	return nil
 }
 
 // mergeVerdicts combines verdicts conservatively: every part must accept, the
@@ -104,6 +166,8 @@ func mergeVerdicts(results []ACRResult, label func(int) string) ACRResult {
 		}
 		merged.ReviewedFiles = append(merged.ReviewedFiles, res.ReviewedFiles...)
 		merged.Findings = append(merged.Findings, res.Findings...)
+		merged.Truncated = merged.Truncated || res.Truncated
+		merged.Usage = merged.Usage.add(res.Usage)
 		summaries = append(summaries, label(i)+": "+res.Summary)
 	}
 	if len(results) == 0 {

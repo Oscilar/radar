@@ -227,6 +227,18 @@ reviewed in several requests, each holding whole files and told which part it
 is; the parts' verdicts merge conservatively. A single file over the budget is
 not truncated: that reviewer fails safe and says why.
 
+`-agent bedrock=<inference profile>` reviews with Claude on Amazon Bedrock
+(package `bedrock`, kept out of the core library so it stays dependency-free).
+It uses the AWS default credential chain and `$AWS_REGION`, calls InvokeModel
+through an inference profile such as `us.anthropic.claude-sonnet-5` with
+adaptive thinking (`$RADAR_BEDROCK_EFFORT`, default `high`; output cap
+`$RADAR_BEDROCK_MAX_TOKENS`, default 64000), and takes the verdict as the input
+of a `submit_verdict` tool, because Bedrock rejects `output_config.format` and
+strict tools for Claude. A response cut off at the output cap is marked
+`truncated`; Radar then reviews that part again in halves, up to three times,
+and a verdict that is still truncated never passes. Every verdict records its
+token `usage`.
+
 #### Generated files
 
 `generated_files` withholds generated files from the review agents, which see
