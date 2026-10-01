@@ -137,6 +137,23 @@ type PullRequestPolicy struct {
 	// ReviewChunkChars caps the patch text sent in one review request; larger
 	// diffs are reviewed in several. Zero means defaultReviewChunkChars.
 	ReviewChunkChars int `json:"review_chunk_chars,omitempty"`
+	// ReviewerMinConfidence overrides min_review_confidence for a reviewer,
+	// keyed by its provenance (e.g. "bedrock/us.anthropic.claude-sonnet-5").
+	// Review-findings only, so a reviewer passing at its floor has still
+	// raised no blocking finding and no defect signal. A floor may sit at
+	// most one point below min_review_confidence.
+	ReviewerMinConfidence map[string]int `json:"reviewer_min_confidence,omitempty"`
+}
+
+// maxConfidenceRelief is how far a reviewer's floor may sit below the
+// policy's min_review_confidence.
+const maxConfidenceRelief = 1
+
+func (p PullRequestPolicy) minConfidenceFor(reviewer string) int {
+	if floor, ok := p.ReviewerMinConfidence[reviewer]; ok {
+		return floor
+	}
+	return p.MinReviewConfidence
 }
 
 // PullRequestReview is a strict, machine-readable decision bound to one head.
@@ -281,6 +298,14 @@ func (p PullRequestPolicy) Validate() error {
 		}
 	default:
 		return fmt.Errorf("radar: approval basis must be allow-rules or review-findings")
+	}
+	if len(p.ReviewerMinConfidence) > 0 && p.basis() != ApprovalBasisReviewFindings {
+		return fmt.Errorf("radar: reviewer_min_confidence requires approval basis review-findings")
+	}
+	for reviewer, floor := range p.ReviewerMinConfidence {
+		if strings.TrimSpace(reviewer) == "" || floor < p.MinReviewConfidence-maxConfidenceRelief || floor > ACRMaxConfidence {
+			return fmt.Errorf("radar: reviewer_min_confidence for %q must be between %d and %d", reviewer, p.MinReviewConfidence-maxConfidenceRelief, ACRMaxConfidence)
+		}
 	}
 	if p.RequiredReviewers < 0 || p.ReviewChunkChars < 0 {
 		return fmt.Errorf("radar: required reviewers and review chunk size cannot be negative")
@@ -520,7 +545,7 @@ func (r *PullRequestReviewer) runReviewers(out *PullRequestReview, diff Diff, ad
 
 	passed := 0
 	for i, res := range results {
-		ok, reason := r.reviewerPasses(res, diff)
+		ok, reason := r.reviewerPasses(describeReviewAgent(r.agents[i]), res, diff)
 		if ok {
 			passed++
 		}
@@ -552,11 +577,15 @@ var defectSignals = map[ChangeSignal]bool{
 	SignalAuthBypass:      true,
 }
 
-func (r *PullRequestReviewer) reviewerPasses(res ACRResult, diff Diff) (bool, string) {
+func (r *PullRequestReviewer) reviewerPasses(reviewer string, res ACRResult, diff Diff) (bool, string) {
 	blocking := r.policy.blockingSeverities()
 	hasBlocking := hasBlockingFinding(res.Findings, blocking)
 	covered := reviewCoversDiff(res, diff) && !res.Truncated
-	confident := res.Confidence >= r.policy.MinReviewConfidence
+	minConfidence := r.policy.MinReviewConfidence
+	if r.policy.basis() == ApprovalBasisReviewFindings {
+		minConfidence = r.policy.minConfidenceFor(reviewer)
+	}
+	confident := res.Confidence >= minConfidence
 	var passed bool
 	var detail string
 	switch r.policy.basis() {
@@ -571,7 +600,7 @@ func (r *PullRequestReviewer) reviewerPasses(res ACRResult, diff Diff) (bool, st
 		// with neither is a concern the reviewer left unstated.
 		explained := res.ModelAccept || res.Accept || len(res.RiskSignals) > 0 || len(res.Findings) > 0
 		passed = confident && covered && !hasBlocking && len(defects) == 0 && explained
-		detail = fmt.Sprintf("confidence=%d/%d defect-signals=%v declined-unexplained=%t", res.Confidence, r.policy.MinReviewConfidence, defects, !explained)
+		detail = fmt.Sprintf("confidence=%d/%d defect-signals=%v declined-unexplained=%t", res.Confidence, minConfidence, defects, !explained)
 	default:
 		claimed := res.Accept || res.ModelAccept
 		passed = claimed && confident && len(res.RiskSignals) == 0 && len(res.SafeSignals) > 0 && covered && !hasBlocking

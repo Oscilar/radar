@@ -640,3 +640,66 @@ func TestSmallTruncatedPartIsNotSplit(t *testing.T) {
 		t.Fatalf("a small truncated part must fail safe after one call, got %s after %d calls", got.Action, len(agent.seen))
 	}
 }
+
+func TestReviewerMinConfidence(t *testing.T) {
+	policy := findingsPolicy(PullRequestModeShadow)
+	policy.RequiredReviewers = 2
+	policy.ReviewerMinConfidence = map[string]int{"bedrock/sonnet": 7}
+	verdict := func(confidence int, mutate func(*ACRResult)) ACRResult {
+		v := structuralVerdict()
+		v.Confidence = confidence
+		if mutate != nil {
+			mutate(&v)
+		}
+		return v
+	}
+	tests := []struct {
+		name        string
+		glm, sonnet ACRResult
+		want        PullRequestAction
+	}{
+		{"sonnet at its floor", verdict(8, nil), verdict(7, nil), PullRequestWouldApprove},
+		{"sonnet below its floor", verdict(8, nil), verdict(6, nil), PullRequestRouteToHuman},
+		{"floor does not apply to glm", verdict(7, nil), verdict(8, nil), PullRequestRouteToHuman},
+		{"floor never excuses a P1", verdict(8, nil), verdict(7, func(v *ACRResult) {
+			v.Findings = append(v.Findings, ReviewFinding{Severity: "P1", Title: "bug", Summary: "breaks"})
+		}), PullRequestRouteToHuman},
+		{"floor never excuses a defect signal", verdict(8, nil), verdict(7, func(v *ACRResult) {
+			v.RiskSignals = append(v.RiskSignals, SignalPerformanceRisk)
+		}), PullRequestRouteToHuman},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reviewer, err := NewPullRequestReviewer(policy, fixedScorer(0),
+				namedAgent{&recordingAgent{result: tt.glm}, "fireworks/glm"},
+				namedAgent{&recordingAgent{result: tt.sonnet}, "bedrock/sonnet"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := reviewer.Review(largeFeatureInput(2)); got.Action != tt.want {
+				t.Fatalf("got %s, want %s; stages %+v", got.Action, tt.want, got.Stages)
+			}
+		})
+	}
+}
+
+func TestReviewerMinConfidenceValidation(t *testing.T) {
+	p := findingsPolicy(PullRequestModeShadow)
+	p.ReviewerMinConfidence = map[string]int{"bedrock/sonnet": 6}
+	if err := p.Validate(); err == nil {
+		t.Fatal("a floor more than one point below min_review_confidence must be rejected")
+	}
+	p.ReviewerMinConfidence = map[string]int{"": 7}
+	if err := p.Validate(); err == nil {
+		t.Fatal("an empty reviewer key must be rejected")
+	}
+	p.ReviewerMinConfidence = map[string]int{"bedrock/sonnet": 7}
+	if err := p.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	allow := testPullRequestPolicy(PullRequestModeShadow)
+	allow.ReviewerMinConfidence = map[string]int{"bedrock/sonnet": 10}
+	if err := allow.Validate(); err == nil {
+		t.Fatal("reviewer floors are review-findings only")
+	}
+}

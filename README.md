@@ -212,7 +212,11 @@ explained any decline with a recorded signal, and raised no defect signal (`bug-
 but do not block. The state gate, deny paths and deny phrases still apply.
 
 `required_reviewers` (default 1) is how many review agents must run; every one
-must pass. Pass several to `-agent`, each with its own model:
+must pass. `reviewer_min_confidence` lowers the confidence bar for one
+reviewer, keyed by its provenance (for example
+`{"bedrock/us.anthropic.claude-sonnet-5": 7}`), by at most one point. The rest
+of the bar still applies, so a reviewer passing at its floor has raised no
+blocking finding and no defect signal. Pass several to `-agent`, each with its own model:
 
 ```sh
 radar-gh review ... -agent openai,fireworks=accounts/fireworks/models/glm-5p3
