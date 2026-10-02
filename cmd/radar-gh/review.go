@@ -93,6 +93,7 @@ func runReview(args []string) int {
 	apply := flags.Bool("apply", false, "allow an APPROVE review when policy mode is approve")
 	trustPath := flags.String("author-trust", "", "private login-to-tier roster (JSON); enables the shadow tier evaluation")
 	trustAuditPath := flags.String("author-trust-audit", "", "file for the private tier audit record; required with -author-trust")
+	packsDir := flags.String("review-packs", "", "directory of review packs (<id>.md) the policy's review_criteria rules name")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -147,6 +148,21 @@ func runReview(args []string) int {
 			fmt.Fprintln(os.Stderr, "radar-gh review:", err)
 			return 1
 		}
+	}
+
+	if policy.ReviewCriteria != nil {
+		criteria, err := loadReviewCriteria(*policyPath, policy, *packsDir)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "radar-gh review: review criteria:", err)
+			return 1
+		}
+		if err := reviewer.UseReviewCriteria(criteria); err != nil {
+			fmt.Fprintln(os.Stderr, "radar-gh review:", err)
+			return 1
+		}
+	} else if *packsDir != "" {
+		fmt.Fprintln(os.Stderr, "radar-gh review: -review-packs needs a policy with review_criteria")
+		return 2
 	}
 
 	first, err := fetchGitHubSnapshot(*repo, *prNumber, policy)

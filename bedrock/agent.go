@@ -153,7 +153,7 @@ func (a *Agent) params(d radar.Diff) anthropic.MessageNewParams {
 	return anthropic.MessageNewParams{
 		Model:     anthropic.Model(a.Model),
 		MaxTokens: a.MaxTokens,
-		System:    []anthropic.TextBlockParam{{Text: radar.ACRSystemPrompt + toolInstruction}},
+		System:    []anthropic.TextBlockParam{{Text: radar.ReviewSystemPrompt(d) + toolInstruction}},
 		Messages:  []anthropic.MessageParam{anthropic.NewUserMessage(anthropic.NewTextBlock(radar.RenderDiffForReview(d)))},
 		Thinking:  anthropic.ThinkingConfigParamUnion{OfAdaptive: &anthropic.ThinkingConfigAdaptiveParam{}},
 		OutputConfig: anthropic.OutputConfigParam{

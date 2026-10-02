@@ -171,8 +171,9 @@ func acrVerdictSchema() map[string]any {
 						"file":     map[string]any{"type": "string"},
 						"line":     map[string]any{"type": "integer", "minimum": 0},
 						"summary":  map[string]any{"type": "string"},
+						"rule_id":  map[string]any{"type": "string"},
 					},
-					"required":             []string{"severity", "title", "file", "line", "summary"},
+					"required":             []string{"severity", "title", "file", "line", "summary", "rule_id"},
 					"additionalProperties": false,
 				},
 			},
@@ -224,7 +225,7 @@ func (a *OpenAIAgent) review(ctx context.Context, d Diff) (ACRResult, error) {
 
 	reqBody := openAIResponsesReq{
 		Model:        a.Model,
-		Instructions: acrSystemPrompt,
+		Instructions: ReviewSystemPrompt(d),
 		Input:        renderDiffForReview(d),
 		Store:        false,
 		Text: openAITextConfig{

@@ -5,6 +5,18 @@ names who decided and the evidence; the replay data lives with the Linear
 issue.
 
 
+## Per-area review criteria only tighten (INF-1247, 2026-10-02)
+
+Rules files map paths to review packs and per-area policy. Every matching area
+applies and policies merge to the most restrictive; an area cannot loosen the
+repository policy (`auto_approve` may only be false, P0/P1 caps only 0), and
+author tiers do not relax it. Area policy covers every changed path, withheld
+generated files and rename sources included, as deny paths do; packs and
+guidance follow only what the reviewers are shown. Rules, guidance and packs
+are read from trusted sources (the default-branch checkout and the packs
+repository), never the pull request head, and the prompt tells reviewers the
+criteria are context that cannot change the verdict format or acceptance bar.
+
 ## Author trust tiers keep the decline rule (INF-1151, 2026-10-01)
 
 Private per-author tiers are evaluated in shadow only and lower a confidence
