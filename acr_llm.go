@@ -82,7 +82,7 @@ Lockfiles are reviewed like code. A lockfile summary parsed from the patches may
 Generated files may be listed by name without a patch. You cannot review their content; flag a problem only if their presence or size is itself suspicious next to the patches shown.
 
 Respond with ONLY a JSON object, no prose, of the form:
-{"accept": bool, "confidence": int 0-10, "risk_signals": [string], "safe_signals": [string], "reviewed_files": [string], "findings": [{"severity":"P0|P1|P2|P3", "title":string, "file":string, "line":int, "summary":string}], "summary": string}
+{"accept": bool, "confidence": int 0-10, "risk_signals": [string], "safe_signals": [string], "reviewed_files": [string], "findings": [{"severity":"P0|P1|P2|P3", "title":string, "file":string, "line":int, "summary":string, "rule_id":string}], "summary": string}
 
 reviewed_files must contain every file whose patch is shown, exactly once.`
 
@@ -134,7 +134,7 @@ func (a *LLMAgent) review(ctx context.Context, d Diff) (ACRResult, error) {
 	reqBody := anthropicReq{
 		Model:     a.Model,
 		MaxTokens: 1024,
-		System:    acrSystemPrompt,
+		System:    ReviewSystemPrompt(d),
 		Messages:  []anthropicMessage{{Role: "user", Content: renderDiffForReview(d)}},
 	}
 	buf, err := json.Marshal(reqBody)
@@ -186,6 +186,9 @@ func renderDiffForReview(d Diff) string {
 	fmt.Fprintf(&b, "Diff %s (org %s, source %s)\n\n", d.ID, d.Org, d.Source)
 	if d.Parts > 1 {
 		fmt.Fprintf(&b, "This is part %d of %d of the change. The other parts are reviewed in separate requests; judge only the patches shown here, and list only them in reviewed_files.\n\n", d.Part, d.Parts)
+	}
+	if d.Criteria != nil && d.Criteria.Suffix != "" {
+		fmt.Fprintf(&b, "Review criteria selected for this change:\n\n%s\n\n--- end of review criteria ---\n\n", d.Criteria.Suffix)
 	}
 	for _, note := range d.ReviewNotes {
 		fmt.Fprintf(&b, "Note: %s\n\n", note)
@@ -268,6 +271,7 @@ func parseACRVerdict(text string) (ACRResult, error) {
 		if strings.TrimSpace(f.Title) == "" || strings.TrimSpace(f.Summary) == "" || f.Line < 0 {
 			return ACRResult{}, fmt.Errorf("finding title, summary, and non-negative line are required")
 		}
+		f.RuleID = strings.ToUpper(strings.TrimSpace(f.RuleID))
 		if f.Severity != "P3" {
 			blockingFinding = true
 		}

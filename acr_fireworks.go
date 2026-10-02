@@ -195,7 +195,7 @@ func (a *FireworksAgent) review(ctx context.Context, d Diff) (ACRResult, error) 
 	reqBody := fireworksChatReq{
 		Model: a.Model,
 		Messages: []fireworksChatMessage{
-			{Role: "system", Content: acrSystemPrompt},
+			{Role: "system", Content: ReviewSystemPrompt(d)},
 			{Role: "user", Content: renderDiffForReview(d)},
 		},
 		Temperature: 0,

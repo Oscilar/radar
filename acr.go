@@ -141,6 +141,8 @@ type ReviewFinding struct {
 	File     string `json:"file,omitempty"`
 	Line     int    `json:"line,omitempty"`
 	Summary  string `json:"summary"`
+	// RuleID is the review pack rule the finding cites, if any.
+	RuleID string `json:"rule_id,omitempty"`
 }
 
 // ReviewAgent is the RADAR Review Agent / Automated Code Review (ACR) component

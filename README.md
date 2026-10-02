@@ -293,6 +293,60 @@ catalog or `gradle.properties` change anywhere) and
 `require_human_on_source_change` (any registry, index, git or URL source
 change). The decision records the summaries in `lockfiles`.
 
+#### Review criteria
+
+A policy's `review_criteria` names a rules file in the trusted checkout the
+policy is read from (`"review_criteria": {"rules": ".radar/rules.yaml"}`).
+The rules map path globs to review packs and to a per-area approval policy;
+see [the example](examples/radar-rules.yaml):
+
+```yaml
+version: 1
+repo_guidance: [CLAUDE.md]      # sent with every review, in the stable prefix
+packs: []                       # packs sent with every review, also in the prefix
+areas:
+  - name: iam
+    paths: ["deployer/internal/pulumi/awsiam/**", "**/*kms*"]
+    packs: [iam-least-privilege]
+    policy: {auto_approve: false}
+  - name: migrations
+    paths: ["**/migrations/**"]
+    packs: [sql-migrations]
+    policy: {decline_blocks: true, max_findings: {P2: 0}}
+```
+
+A pack is `<id>.md` in the directory passed to `-review-packs`: front matter
+with `id` and `version`, then Markdown whose rules are list items that start
+with a bold rule ID (`- **GO-ERR-01** ...`). Rule IDs are unique across packs.
+Radar sends each reviewer only the packs whose areas the change touches, plus
+the nearest-ancestor `AGENTS.md` (`directory_guidance`) of each reviewed file.
+The repository guidance and the always-on packs follow the system prompt, so
+they form a prefix that is the same for every pull request in the repository
+and caches; the selected packs and directory guidance precede the patches.
+Guidance is capped at `max_guidance_chars` (default 96000), nearest files
+first, and anything cut is marked `truncated`; criteria over half of
+`review_chunk_chars` fail safe. Every finding may cite a `rule_id`; a cited ID
+no selected pack defines is removed from the finding and listed in
+`criteria.unknown_rule_citations`.
+
+The rules and guidance come from the trusted default-branch checkout, and only
+files git tracks there count as guidance, so a pull request cannot rewrite the
+criteria it is reviewed against. A file withheld as generated selects no packs
+and no guidance, but area policy, like deny paths, applies to every changed
+path, including withheld files and rename sources.
+
+Every area the change touches applies, and their policies merge to the most
+restrictive. Area policy only tightens: `auto_approve: false` (the only allowed
+value) routes the change to a human (`pr.area-policy`); `decline_blocks` makes a
+decline block even where an author tier would waive the accept claim
+(review-findings already blocks on a decline); `max_findings` caps how many
+findings of a severity a reviewer may raise and still pass (P0 and P1 always
+block, so they may only be capped at 0). Author tiers never relax area policy.
+The decision's `criteria` records the rules file's SHA-256, each pack's id,
+version and SHA-256 and the areas that selected it, each guidance file's
+SHA-256, the areas matched and the merged policy. A policy that names criteria
+which were not loaded routes every pull request to a human.
+
 #### Stacked pull requests
 
 With `allow_stacked`, a pull request whose base is another open

@@ -282,7 +282,7 @@ func (r *PullRequestReviewer) ReviewWithAuthorTrust(in PullRequestInput, trust A
 		// confidence; at or above it a decline is genuine. Review-findings keeps
 		// TJ's rule that a decline blocks.
 		waive := adjusted.basis() == ApprovalBasisAllowRules && res.Confidence < ACRMinConfidence
-		ok, reason := reviewerVerdict(adjusted, floor, waive, res, facts.diff)
+		ok, reason := reviewerVerdict(adjusted, facts.areaPolicy, floor, waive, res, facts.diff)
 		if ok {
 			passed++
 		}

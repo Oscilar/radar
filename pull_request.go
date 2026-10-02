@@ -146,6 +146,16 @@ type PullRequestPolicy struct {
 	// raised no blocking finding and no defect signal. A floor may sit at
 	// most one point below min_review_confidence.
 	ReviewerMinConfidence map[string]int `json:"reviewer_min_confidence,omitempty"`
+	// ReviewCriteria selects review packs, guidance and per-area policy from
+	// a rules file in the trusted checkout the policy is read from.
+	ReviewCriteria *PullRequestReviewCriteria `json:"review_criteria,omitempty"`
+}
+
+// PullRequestReviewCriteria names the review-criteria rules file.
+type PullRequestReviewCriteria struct {
+	// Rules is the rules file's path in the trusted checkout, such as
+	// ".radar/rules.yaml".
+	Rules string `json:"rules"`
 }
 
 // maxConfidenceRelief is how far a reviewer's floor may sit below the
@@ -186,8 +196,10 @@ type PullRequestReview struct {
 	Lockfiles []LockfileSummary `json:"lockfiles,omitempty"`
 	// GeneratedUnlisted are reviewed files whose generated-code header the
 	// change itself adds, outside every configured generated path.
-	GeneratedUnlisted []string      `json:"generated_unlisted,omitempty"`
-	Stages            []StageResult `json:"stages"`
+	GeneratedUnlisted []string `json:"generated_unlisted,omitempty"`
+	// Criteria records the review packs, guidance and area policy applied.
+	Criteria *ReviewCriteriaRecord `json:"criteria,omitempty"`
+	Stages   []StageResult         `json:"stages"`
 }
 
 // PullRequestReviewerVerdict is one review agent's verdict and whether it met
@@ -206,6 +218,7 @@ type PullRequestReviewer struct {
 	calibrator *Calibrator
 	agents     []ReviewAgent
 	generated  generatedMatcher
+	criteria   *ReviewCriteria
 }
 
 // NewPullRequestReviewer validates policy and constructs a generic PR
@@ -251,6 +264,20 @@ func (r *PullRequestReviewer) UseGitattributes(data []byte) error {
 		return err
 	}
 	r.generated = newGeneratedMatcher(*r.policy.GeneratedFiles, paths)
+	return nil
+}
+
+// UseReviewCriteria loads the review criteria the policy's review_criteria
+// names. A policy that names criteria routes every pull request to a human
+// until they are loaded.
+func (r *PullRequestReviewer) UseReviewCriteria(c ReviewCriteria) error {
+	if r.policy.ReviewCriteria == nil {
+		return fmt.Errorf("radar: policy has no review_criteria block")
+	}
+	if err := c.Validate(); err != nil {
+		return err
+	}
+	r.criteria = &c
 	return nil
 }
 
@@ -308,6 +335,11 @@ func (p PullRequestPolicy) Validate() error {
 	for reviewer, floor := range p.ReviewerMinConfidence {
 		if strings.TrimSpace(reviewer) == "" || floor < p.MinReviewConfidence-maxConfidenceRelief || floor > ACRMaxConfidence {
 			return fmt.Errorf("radar: reviewer_min_confidence for %q must be between %d and %d", reviewer, p.MinReviewConfidence-maxConfidenceRelief, ACRMaxConfidence)
+		}
+	}
+	if p.ReviewCriteria != nil {
+		if err := validateRepositoryPath(p.ReviewCriteria.Rules); err != nil {
+			return fmt.Errorf("radar: review_criteria.rules: %w", err)
 		}
 	}
 	if p.RequiredReviewers < 0 || p.ReviewChunkChars < 0 {
@@ -389,6 +421,7 @@ type reviewFacts struct {
 	riskPassed    bool
 	diff          Diff
 	results       []ACRResult
+	areaPolicy    ReviewAreaPolicy
 }
 
 func (r *PullRequestReviewer) review(in PullRequestInput) (PullRequestReview, reviewFacts) {
@@ -430,6 +463,15 @@ func (r *PullRequestReviewer) review(in PullRequestInput) (PullRequestReview, re
 		denied = denied || backstop
 	}
 
+	criteria, areaPolicy, ok := r.selectCriteria(&out, in, add)
+	if !ok {
+		return out, facts
+	}
+	if areaPolicy.humanRequired() {
+		denied = true
+	}
+	facts.areaPolicy = areaPolicy
+
 	allowlisted := true
 	if r.policy.basis() == ApprovalBasisAllowRules {
 		rule, allowReason := matchPullRequestRule(r.policy, in)
@@ -457,7 +499,9 @@ func (r *PullRequestReviewer) review(in PullRequestInput) (PullRequestReview, re
 		add("pr.risk-score", true, fmt.Sprintf("risk percentile %.1f recorded, not gating under review-findings", out.RiskPercentile))
 	}
 
-	reviewDiff := r.reviewableDiff(diff, in, lockfiles)
+	budget := r.policy.reviewChunkChars() - criteria.chars()
+	reviewDiff := r.reviewableDiff(diff, in, lockfiles, budget)
+	reviewDiff.Criteria = criteria
 	out.Withheld = reviewDiff.Withheld
 	for _, f := range in.Files {
 		if _, unlisted := r.generated.classify(f); unlisted {
@@ -468,7 +512,7 @@ func (r *PullRequestReviewer) review(in PullRequestInput) (PullRequestReview, re
 	if len(reviewDiff.Changes) == 0 {
 		add("pr.review-agent", false, fmt.Sprintf("all %d changed files are generated; nothing for the review agents to assess", len(out.Withheld)))
 	} else {
-		agentPassed, facts.results = r.runReviewers(&out, reviewDiff, add)
+		agentPassed, facts.results = r.runReviewers(&out, reviewDiff, budget, areaPolicy, add)
 		facts.agentReviewed = true
 	}
 	facts.diff = reviewDiff
@@ -480,6 +524,48 @@ func (r *PullRequestReviewer) review(in PullRequestInput) (PullRequestReview, re
 	}
 	out.Action = decideAction(r.policy.Mode, len(in.Stack) > 0, denied, out.Eligible, agentPassed)
 	return out, facts
+}
+
+// selectCriteria resolves the review criteria for in and records them. It
+// fails closed when the policy names criteria that were not loaded.
+func (r *PullRequestReviewer) selectCriteria(out *PullRequestReview, in PullRequestInput, add func(string, bool, string) bool) (*ReviewContext, ReviewAreaPolicy, bool) {
+	if r.policy.ReviewCriteria == nil {
+		return nil, ReviewAreaPolicy{}, true
+	}
+	if r.criteria == nil {
+		add("pr.review-criteria", false, "policy names review criteria "+r.policy.ReviewCriteria.Rules+" but none were loaded")
+		return nil, ReviewAreaPolicy{}, false
+	}
+	ctx, record, area := r.criteria.selectCriteria(in.Files, func(f PullRequestFile) bool { return !r.withheld(f) })
+	out.Criteria = &record
+	if limit := r.policy.reviewChunkChars() / 2; ctx.chars() > limit {
+		add("pr.review-criteria", false, fmt.Sprintf("selected review criteria are %d characters, over half the %d-character review budget", ctx.chars(), r.policy.reviewChunkChars()))
+		return nil, ReviewAreaPolicy{}, false
+	}
+	packs := make([]string, 0, len(record.Packs))
+	for _, p := range record.Packs {
+		packs = append(packs, fmt.Sprintf("%s@v%d", p.ID, p.Version))
+	}
+	add("pr.review-criteria", true, fmt.Sprintf("%d area(s), packs [%s], %d guidance file(s)", len(record.Areas), strings.Join(packs, " "), len(record.Guidance)))
+	if area.humanRequired() {
+		var names []string
+		for _, a := range record.Areas {
+			names = append(names, a.Name)
+		}
+		add("pr.area-policy", false, "an area this change touches requires human approval (auto_approve false); areas: "+strings.Join(names, ", "))
+	}
+	return ctx, area, true
+}
+
+// withheld reports whether reviewableDiff leaves f out of what the agents see.
+func (r *PullRequestReviewer) withheld(f PullRequestFile) bool {
+	if r.policy.Lockfiles != nil {
+		if _, ok := lockfileKindOf(f.Path); ok {
+			return false
+		}
+	}
+	reason, _ := r.generated.classify(f)
+	return reason != ""
 }
 
 func decideAction(mode PullRequestMode, stacked, denied, eligible, agentPassed bool) PullRequestAction {
@@ -511,7 +597,7 @@ func (r *PullRequestReviewer) lockfileSummaries(in PullRequestInput) []LockfileS
 // lockfile review on, lockfiles are kept: one whose +/- lines repeat an
 // earlier lockfile's is shown as a pointer to it, and one too large for a
 // single request is split by hunk so every line is still reviewed.
-func (r *PullRequestReviewer) reviewableDiff(diff Diff, in PullRequestInput, lockfiles []LockfileSummary) Diff {
+func (r *PullRequestReviewer) reviewableDiff(diff Diff, in PullRequestInput, lockfiles []LockfileSummary, chunkBudget int) Diff {
 	out := diff
 	out.Changes = nil
 	out.Lockfiles = lockfiles
@@ -520,7 +606,7 @@ func (r *PullRequestReviewer) reviewableDiff(diff Diff, in PullRequestInput, loc
 		summaries[s.Path] = s
 	}
 	firstWith := map[string]string{}
-	budget := r.policy.reviewChunkChars() - chunkOverheadChars - 512
+	budget := chunkBudget - chunkOverheadChars - 512
 	for i, f := range in.Files {
 		change := diff.Changes[i]
 		if summary, isLock := summaries[f.Path]; isLock {
@@ -558,21 +644,33 @@ func (r *PullRequestReviewer) reviewableDiff(diff Diff, in PullRequestInput, loc
 
 // runReviewers runs every agent concurrently and records each verdict. It
 // passes only when every agent passes.
-func (r *PullRequestReviewer) runReviewers(out *PullRequestReview, diff Diff, add func(string, bool, string) bool) (bool, []ACRResult) {
+func (r *PullRequestReviewer) runReviewers(out *PullRequestReview, diff Diff, budget int, area ReviewAreaPolicy, add func(string, bool, string) bool) (bool, []ACRResult) {
 	results := make([]ACRResult, len(r.agents))
 	var wg sync.WaitGroup
 	for i, agent := range r.agents {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results[i] = reviewInChunks(agent, diff, r.policy.reviewChunkChars())
+			results[i] = reviewInChunks(agent, diff, budget)
 		}()
 	}
 	wg.Wait()
 
+	if out.Criteria != nil {
+		known := map[string]bool{}
+		if diff.Criteria != nil {
+			for _, id := range diff.Criteria.RuleIDs {
+				known[id] = true
+			}
+		}
+		for i := range results {
+			out.Criteria.UnknownRuleCitations = append(out.Criteria.UnknownRuleCitations, clearUnknownRuleIDs(&results[i], known)...)
+		}
+	}
+
 	passed := 0
 	for i, res := range results {
-		ok, reason := r.reviewerPasses(describeReviewAgent(r.agents[i]), res, diff)
+		ok, reason := r.reviewerPasses(describeReviewAgent(r.agents[i]), res, diff, area)
 		if ok {
 			passed++
 		}
@@ -604,20 +702,23 @@ var defectSignals = map[ChangeSignal]bool{
 	SignalAuthBypass:      true,
 }
 
-func (r *PullRequestReviewer) reviewerPasses(reviewer string, res ACRResult, diff Diff) (bool, string) {
+func (r *PullRequestReviewer) reviewerPasses(reviewer string, res ACRResult, diff Diff, area ReviewAreaPolicy) (bool, string) {
 	minConfidence := r.policy.MinReviewConfidence
 	if r.policy.basis() == ApprovalBasisReviewFindings {
 		minConfidence = r.policy.minConfidenceFor(reviewer)
 	}
-	return reviewerVerdict(r.policy, minConfidence, false, res, diff)
+	return reviewerVerdict(r.policy, area, minConfidence, false, res, diff)
 }
 
-// reviewerVerdict applies the policy's bar for one reviewer. waiveClaim drops
-// the accept-claim requirement under allow-rules only; a decline always blocks
-// under review-findings.
-func reviewerVerdict(p PullRequestPolicy, minConfidence int, waiveClaim bool, res ACRResult, diff Diff) (bool, string) {
+// reviewerVerdict applies the policy's bar, tightened by the area policy, for
+// one reviewer. waiveClaim drops the accept-claim requirement under
+// allow-rules only, unless the area policy makes declines block; a decline
+// always blocks under review-findings.
+func reviewerVerdict(p PullRequestPolicy, area ReviewAreaPolicy, minConfidence int, waiveClaim bool, res ACRResult, diff Diff) (bool, string) {
 	blocking := p.blockingSeverities()
 	hasBlocking := hasBlockingFinding(res.Findings, blocking)
+	overLimit := area.exceedsFindingLimits(res.Findings)
+	waiveClaim = waiveClaim && !area.DeclineBlocks
 	covered := reviewCoversDiff(res, diff) && !res.Truncated
 	confident := res.Confidence >= minConfidence
 	var passed bool
@@ -642,6 +743,10 @@ func reviewerVerdict(p PullRequestPolicy, minConfidence int, waiveClaim bool, re
 		claimed := res.Accept || res.ModelAccept
 		passed = (claimed || waiveClaim) && confident && len(res.RiskSignals) == 0 && len(res.SafeSignals) > 0 && covered && !hasBlocking
 		detail = fmt.Sprintf("accept=%t confidence=%d/%d risk-signals=%d", claimed, res.Confidence, minConfidence, len(res.RiskSignals))
+	}
+	if overLimit != "" {
+		passed = false
+		detail += " area-finding-limit=" + overLimit
 	}
 	return passed, fmt.Sprintf("%s reviewed-files=%d/%d blocking-findings(%s)=%t: %s",
 		detail, len(res.ReviewedFiles), len(diff.Changes), strings.Join(blocking, ","), hasBlocking, res.Summary)
