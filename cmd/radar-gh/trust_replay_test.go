@@ -80,7 +80,7 @@ func TestTrustReplayTwoReviewersUnderReviewFindings(t *testing.T) {
 		ApprovalBasis: radar.ApprovalBasisReviewFindings, RequiredReviewers: 2,
 		CalibrationSample: []float64{0, 1, 2, 3}, MinReviewConfidence: 8,
 		BlockingFindingSeverities: []string{"P0", "P1"},
-		AuthorTrust: &radar.PullRequestAuthorTrust{Tiers: []radar.PullRequestTrustTier{{Tier: 2, MinReviewConfidence: 7}}},
+		AuthorTrust:               &radar.PullRequestAuthorTrust{Tiers: []radar.PullRequestTrustTier{{Tier: 2, MinReviewConfidence: 7}}},
 	}
 	in := radar.PullRequestInput{
 		ID: "o/r#1", Repository: "o/r", Number: 1, BaseRef: "main", HeadSHA: strings.Repeat("a", 40),

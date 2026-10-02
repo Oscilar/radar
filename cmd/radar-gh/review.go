@@ -296,9 +296,25 @@ func fetchCommitMessages(repo string, number int) ([]string, error) {
 	return messages, nil
 }
 
+// writeAuditFile refuses a symlink and replaces any existing file, because
+// OpenFile's mode applies only on creation and the audit names tiers.
 func writeAuditFile(path string, audit radar.AuthorTrustAudit) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if info, err := os.Lstat(path); err == nil {
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("audit path is not a regular file")
+		}
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
+		return err
+	}
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
 		return err
 	}
 	if err := writeJSON(f, audit); err != nil {

@@ -277,10 +277,11 @@ func (r *PullRequestReviewer) ReviewWithAuthorTrust(in PullRequestInput, trust A
 		if adjusted.basis() == ApprovalBasisReviewFindings {
 			floor = max(r.policy.minConfidenceFor(reviewer)-relief, r.policy.MinReviewConfidence-maxConfidenceRelief)
 		}
-		// Under allow-rules the prompt tells the model not to accept below the
-		// live minimum, so there a decline carries no information beyond the
-		// confidence. Review-findings keeps TJ's rule that a decline blocks.
-		waive := adjusted.basis() == ApprovalBasisAllowRules && res.Confidence < r.policy.MinReviewConfidence
+		// The review prompt tells the model not to accept below ACRMinConfidence,
+		// so under allow-rules a decline there carries no information beyond the
+		// confidence; at or above it a decline is genuine. Review-findings keeps
+		// TJ's rule that a decline blocks.
+		waive := adjusted.basis() == ApprovalBasisAllowRules && res.Confidence < ACRMinConfidence
 		ok, reason := reviewerVerdict(adjusted, floor, waive, res, facts.diff)
 		if ok {
 			passed++

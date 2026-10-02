@@ -356,3 +356,14 @@ func TestAuthorTrustRuleLimitsNeedAllowRules(t *testing.T) {
 		t.Fatalf("review-findings tier policy rejected: %v", err)
 	}
 }
+
+func TestAuthorTrustKeepsGenuineDeclinesAboveThePromptThreshold(t *testing.T) {
+	p := trustPolicy()
+	p.MinReviewConfidence = 10
+	p.AuthorTrust = &PullRequestAuthorTrust{Tiers: []PullRequestTrustTier{{Tier: 2, MinReviewConfidence: 9}}}
+	in := codeInput(2, 10)
+	_, audit, _ := reviewTrust(t, p, in, agentFor(in, 9, false), AuthorTrust{Tier: 2})
+	if audit.TierAction == PullRequestWouldApprove {
+		t.Fatalf("a decline at 9 is genuine (the prompt only forbids accepting below 8): %+v", audit)
+	}
+}
