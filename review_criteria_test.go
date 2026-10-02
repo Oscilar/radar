@@ -73,6 +73,7 @@ func TestParseReviewPack(t *testing.T) {
 		"unknown key":        "---\nid: go\nversion: 1\nseverity: P0\n---\nx\n",
 		"duplicate rule":     "---\nid: go\nversion: 1\n---\n- **GO-1** a\n- **GO-1** b\n",
 		"empty":              "---\nid: go\nversion: 1\n---\n\n",
+		"prose only":         "---\nid: go\nversion: 1\n---\nWrap errors.\n",
 		"line not key:value": "---\nid: go\nversion 1\n---\nx\n",
 	} {
 		if _, err := ParseReviewPack("go", []byte(data)); err == nil {
@@ -87,19 +88,20 @@ func TestReviewRulesValidate(t *testing.T) {
 	}
 	tru := true
 	for name, mutate := range map[string]func(*ReviewCriteria){
-		"auto_approve true":   func(c *ReviewCriteria) { c.Rules.Areas[1].Policy.AutoApprove = &tru },
-		"P1 cap above zero":   func(c *ReviewCriteria) { c.Rules.Areas[2].Policy.MaxFindings = map[string]int{"P1": 1} },
-		"negative P2 cap":     func(c *ReviewCriteria) { c.Rules.Areas[2].Policy.MaxFindings = map[string]int{"P2": -1} },
-		"unknown severity":    func(c *ReviewCriteria) { c.Rules.Areas[2].Policy.MaxFindings = map[string]int{"p2": 0} },
-		"duplicate area":      func(c *ReviewCriteria) { c.Rules.Areas[1].Name = "go" },
-		"area without effect": func(c *ReviewCriteria) { c.Rules.Areas[2].Policy = ReviewAreaPolicy{} },
-		"area without paths":  func(c *ReviewCriteria) { c.Rules.Areas[0].Paths = nil },
-		"bad glob":            func(c *ReviewCriteria) { c.Rules.Areas[0].Paths = []string{"../x"} },
-		"pack not loaded":     func(c *ReviewCriteria) { delete(c.Packs, "go") },
-		"bad pack id":         func(c *ReviewCriteria) { c.Rules.Packs = []string{"Go"} },
-		"guidance path":       func(c *ReviewCriteria) { c.Rules.RepoGuidance = []string{"../CLAUDE.md"} },
-		"directory guidance":  func(c *ReviewCriteria) { c.Rules.DirectoryGuidance = "docs/AGENTS.md" },
-		"no version":          func(c *ReviewCriteria) { c.Rules.Version = 0 },
+		"auto_approve true":     func(c *ReviewCriteria) { c.Rules.Areas[1].Policy.AutoApprove = &tru },
+		"P1 cap above zero":     func(c *ReviewCriteria) { c.Rules.Areas[2].Policy.MaxFindings = map[string]int{"P1": 1} },
+		"negative P2 cap":       func(c *ReviewCriteria) { c.Rules.Areas[2].Policy.MaxFindings = map[string]int{"P2": -1} },
+		"unknown severity":      func(c *ReviewCriteria) { c.Rules.Areas[2].Policy.MaxFindings = map[string]int{"p2": 0} },
+		"duplicate area":        func(c *ReviewCriteria) { c.Rules.Areas[1].Name = "go" },
+		"area without effect":   func(c *ReviewCriteria) { c.Rules.Areas[2].Policy = ReviewAreaPolicy{} },
+		"area without paths":    func(c *ReviewCriteria) { c.Rules.Areas[0].Paths = nil },
+		"bad glob":              func(c *ReviewCriteria) { c.Rules.Areas[0].Paths = []string{"../x"} },
+		"pack not loaded":       func(c *ReviewCriteria) { delete(c.Packs, "go") },
+		"bad pack id":           func(c *ReviewCriteria) { c.Rules.Packs = []string{"Go"} },
+		"guidance path":         func(c *ReviewCriteria) { c.Rules.RepoGuidance = []string{"../CLAUDE.md"} },
+		"directory guidance":    func(c *ReviewCriteria) { c.Rules.DirectoryGuidance = "docs/AGENTS.md" },
+		"no version":            func(c *ReviewCriteria) { c.Rules.Version = 0 },
+		"repo guidance missing": func(c *ReviewCriteria) { delete(c.Guidance, "CLAUDE.md") },
 		"rule in two packs": func(c *ReviewCriteria) {
 			c.Packs["iam-least-privilege"] = mustPack(t, "iam-least-privilege", "---\nid: iam-least-privilege\nversion: 1\n---\n- **GO-ERR-01** x\n")
 		},
@@ -374,5 +376,24 @@ func TestRuleCitationsWithoutCriteriaAreCleared(t *testing.T) {
 	}
 	if got := reviewer.Review(largeFeatureInput(1)); got.Agent.Findings[0].RuleID != "" {
 		t.Fatalf("a review without packs cannot cite a rule: %+v", got.Agent.Findings)
+	}
+}
+
+func TestAreaFindingLimitIgnoresSeverityCase(t *testing.T) {
+	p := ReviewAreaPolicy{MaxFindings: map[string]int{"P2": 0}}
+	if p.exceedsFindingLimits([]ReviewFinding{{Severity: " p2"}}) == "" {
+		t.Fatal("a lowercase p2 must count against the P2 cap")
+	}
+}
+
+func TestUseReviewCriteriaRequiresThePolicysRulesFile(t *testing.T) {
+	reviewer, err := NewPullRequestReviewer(criteriaPolicy(), fixedScorer(0), &recordingAgent{result: structuralVerdict()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := testCriteria(t)
+	c.RulesPath = "other/rules.yaml"
+	if err := reviewer.UseReviewCriteria(c); err == nil {
+		t.Fatal("criteria from another rules file were accepted")
 	}
 }

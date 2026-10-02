@@ -317,7 +317,8 @@ areas:
 
 A pack is `<id>.md` in the directory passed to `-review-packs`: front matter
 with `id` and `version`, then Markdown whose rules are list items that start
-with a bold rule ID (`- **GO-ERR-01** ...`). Rule IDs are unique across packs.
+with a bold rule ID (`- **GO-ERR-01** ...`); a pack with no rules is rejected.
+Rule IDs are unique across packs, and every `repo_guidance` file must be tracked.
 Radar sends each reviewer only the packs whose areas the change touches, plus
 the nearest-ancestor `AGENTS.md` (`directory_guidance`) of each reviewed file.
 The repository guidance and the always-on packs follow the system prompt, so

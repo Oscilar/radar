@@ -274,6 +274,9 @@ func (r *PullRequestReviewer) UseReviewCriteria(c ReviewCriteria) error {
 	if r.policy.ReviewCriteria == nil {
 		return fmt.Errorf("radar: policy has no review_criteria block")
 	}
+	if c.RulesPath != r.policy.ReviewCriteria.Rules {
+		return fmt.Errorf("radar: review criteria were loaded from %q, but the policy names %q", c.RulesPath, r.policy.ReviewCriteria.Rules)
+	}
 	if err := c.Validate(); err != nil {
 		return err
 	}

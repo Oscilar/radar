@@ -105,7 +105,7 @@ func (p ReviewAreaPolicy) validate(area string) error {
 func (p ReviewAreaPolicy) exceedsFindingLimits(findings []ReviewFinding) string {
 	counts := map[string]int{}
 	for _, f := range findings {
-		counts[f.Severity]++
+		counts[strings.ToUpper(strings.TrimSpace(f.Severity))]++
 	}
 	severities := make([]string, 0, len(p.MaxFindings))
 	for s := range p.MaxFindings {
@@ -273,8 +273,8 @@ func ParseReviewPack(id string, data []byte) (ReviewPack, error) {
 		pack.Rules = append(pack.Rules, m[1])
 	}
 	pack.body = strings.TrimSpace(body)
-	if pack.body == "" {
-		return pack, fmt.Errorf("radar: review pack %s is empty", id)
+	if len(pack.Rules) == 0 {
+		return pack, fmt.Errorf("radar: review pack %s has no rules (list items starting with a bold rule ID such as **GO-ERR-01**)", id)
 	}
 	return pack, nil
 }
@@ -303,6 +303,11 @@ func (c ReviewCriteria) Validate() error {
 	for _, id := range c.Rules.PackIDs() {
 		if _, ok := c.Packs[id]; !ok {
 			return fmt.Errorf("radar: review pack %q is named by the rules but not loaded", id)
+		}
+	}
+	for _, p := range c.Rules.RepoGuidance {
+		if _, ok := c.Guidance[p]; !ok {
+			return fmt.Errorf("radar: repo_guidance %s is not a tracked file in the trusted checkout", p)
 		}
 	}
 	owner := map[string]string{}
