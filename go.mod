@@ -7,7 +7,7 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.38.0
 	github.com/aws/aws-sdk-go-v2/config v1.27.27
 	github.com/aws/aws-sdk-go-v2/credentials v1.17.27
-	go.yaml.in/yaml/v4 v4.0.0-rc.2
+	go.yaml.in/yaml/v4 v4.0.0-rc.6
 )
 
 require (
