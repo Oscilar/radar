@@ -596,11 +596,14 @@ func (r *PullRequestReviewer) reviewerPasses(reviewer string, res ACRResult, dif
 				defects = append(defects, string(s))
 			}
 		}
-		// A decline must be explained by a recorded signal or finding; one
+		// A reviewer that declines blocks, whatever its findings and
+		// confidence: reviewers often say "a human should look" only by
+		// declining with a size or shape signal, which do not block on their
+		// own (TJ, INF-1220; see DECISIONS.md).
 		// with neither is a concern the reviewer left unstated.
-		explained := res.ModelAccept || res.Accept || len(res.RiskSignals) > 0 || len(res.Findings) > 0
-		passed = confident && covered && !hasBlocking && len(defects) == 0 && explained
-		detail = fmt.Sprintf("confidence=%d/%d defect-signals=%v declined-unexplained=%t", res.Confidence, minConfidence, defects, !explained)
+		declined := !res.ModelAccept && !res.Accept
+		passed = confident && covered && !hasBlocking && len(defects) == 0 && !declined
+		detail = fmt.Sprintf("confidence=%d/%d defect-signals=%v declined=%t", res.Confidence, minConfidence, defects, declined)
 	default:
 		claimed := res.Accept || res.ModelAccept
 		passed = claimed && confident && len(res.RiskSignals) == 0 && len(res.SafeSignals) > 0 && covered && !hasBlocking

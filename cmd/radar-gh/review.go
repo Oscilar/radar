@@ -87,7 +87,7 @@ func runReview(args []string) int {
 	repo := flags.String("repo", "", "GitHub owner/repository (required)")
 	prNumber := flags.Int("pr", 0, "pull request number (required)")
 	policyPath := flags.String("policy", "", "path to a versioned JSON policy (required)")
-	agentName := flags.String("agent", "openai", "review agents, comma-separated: openai, anthropic, fireworks, bedrock, or rule-based, each optionally name=model")
+	agentName := flags.String("agent", "openai", "review agents, comma-separated: openai, anthropic, fireworks, bedrock, bedrock-openai, or rule-based, each optionally name=model")
 	expectedHead := flags.String("expected-head", "", "event head SHA; required in approval mode")
 	settle := flags.Duration("settle", 10*time.Second, "time between check observations")
 	apply := flags.Bool("apply", false, "allow an APPROVE review when policy mode is approve")
@@ -296,6 +296,8 @@ func newReviewAgent(name, model string) (radar.ReviewAgent, error) {
 		return radar.NewFireworksAgentForModel(model)
 	case "bedrock":
 		return bedrock.NewAgent(context.Background(), model)
+	case "bedrock-openai":
+		return bedrock.NewCodexAgent(context.Background(), model)
 	case "rule-based":
 		return radar.RuleBasedAgent{}, nil
 	default:

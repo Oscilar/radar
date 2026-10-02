@@ -206,7 +206,8 @@ with line count, so it is recorded but does not gate). It must not set them, so
 a policy never looks as if a limit applies when it does not. A reviewer passes
 when it covered every file it was shown, reported confidence of at least
 `min_review_confidence`, raised no finding in `blocking_finding_severities`,
-explained any decline with a recorded signal, and raised no defect signal (`bug-or-logic-error`, `performance-risk`,
+accepted (a decline blocks, whatever its findings or confidence; see
+DECISIONS.md), and raised no defect signal (`bug-or-logic-error`, `performance-risk`,
 `secrets-exposure`, `sql-injection`, `auth-bypass`). `structural-change` and
 `high-review-effort` describe a change's size and shape, so they are recorded
 but do not block. The state gate, deny paths and deny phrases still apply.
@@ -242,6 +243,16 @@ strict tools for Claude. A response cut off at the output cap is marked
 `truncated`; Radar then reviews that part again in halves, up to three times,
 and a verdict that is still truncated never passes. Every verdict records its
 token `usage`.
+
+`-agent bedrock-openai=<model>` reviews with an OpenAI model on Bedrock's
+Mantle endpoint, such as `openai.gpt-5.6-terra`: the Responses API with the
+shared prompt and the strict verdict schema (Mantle accepts it for OpenAI
+models), signed with SigV4 for `bedrock-mantle` from the AWS default credential
+chain and `$AWS_REGION`. Reasoning effort is `$RADAR_CODEX_EFFORT` (default
+`high`) and the output cap `$RADAR_CODEX_MAX_TOKENS` (default 32000). It sends
+`prompt_cache_options: {mode: explicit}` with no breakpoint: Radar's shared
+prefix is too short to be read back, so the default implicit mode would only
+bill cache writes, at 1.25x input, on every review.
 
 #### Generated files
 
