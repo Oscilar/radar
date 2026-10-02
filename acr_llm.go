@@ -84,7 +84,7 @@ Generated files may be listed by name without a patch. You cannot review their c
 Respond with ONLY a JSON object, no prose, of the form:
 {"accept": bool, "confidence": int 0-10, "risk_signals": [string], "safe_signals": [string], "reviewed_files": [string], "findings": [{"severity":"P0|P1|P2|P3", "title":string, "file":string, "line":int, "summary":string, "rule_id":string}], "summary": string}
 
-reviewed_files must contain every file whose patch is shown, exactly once.`
+reviewed_files must contain every file whose patch is shown, exactly once. rule_id is "" unless review criteria below give the rule you cite.`
 
 // anthropic request/response shapes (minimal subset).
 type anthropicReq struct {

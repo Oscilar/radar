@@ -327,7 +327,8 @@ Guidance is capped at `max_guidance_chars` (default 96000), nearest files
 first, and anything cut is marked `truncated`; criteria over half of
 `review_chunk_chars` fail safe. Every finding may cite a `rule_id`; a cited ID
 no selected pack defines is removed from the finding and listed in
-`criteria.unknown_rule_citations`.
+`criteria.unknown_rule_citations` (without criteria, every citation is
+removed: reviewers invent IDs when none are given).
 
 The rules and guidance come from the trusted default-branch checkout, and only
 files git tracks there count as guidance, so a pull request cannot rewrite the

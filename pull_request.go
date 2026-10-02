@@ -656,15 +656,16 @@ func (r *PullRequestReviewer) runReviewers(out *PullRequestReview, diff Diff, bu
 	}
 	wg.Wait()
 
-	if out.Criteria != nil {
-		known := map[string]bool{}
-		if diff.Criteria != nil {
-			for _, id := range diff.Criteria.RuleIDs {
-				known[id] = true
-			}
+	known := map[string]bool{}
+	if diff.Criteria != nil {
+		for _, id := range diff.Criteria.RuleIDs {
+			known[id] = true
 		}
-		for i := range results {
-			out.Criteria.UnknownRuleCitations = append(out.Criteria.UnknownRuleCitations, clearUnknownRuleIDs(&results[i], known)...)
+	}
+	for i := range results {
+		unknown := clearUnknownRuleIDs(&results[i], known)
+		if out.Criteria != nil {
+			out.Criteria.UnknownRuleCitations = append(out.Criteria.UnknownRuleCitations, unknown...)
 		}
 	}
 

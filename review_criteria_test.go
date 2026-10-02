@@ -364,3 +364,15 @@ func TestParseVerdictNormalisesRuleID(t *testing.T) {
 		t.Fatalf("rule id = %q", res.Findings[0].RuleID)
 	}
 }
+
+func TestRuleCitationsWithoutCriteriaAreCleared(t *testing.T) {
+	verdict := structuralVerdict()
+	verdict.Findings = []ReviewFinding{{Severity: "P3", Title: "a", Summary: "a", RuleID: "TEST-CONFIG-HARDCODED-VALUE"}}
+	reviewer, err := NewPullRequestReviewer(findingsPolicy(PullRequestModeShadow), fixedScorer(0), &recordingAgent{result: verdict})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reviewer.Review(largeFeatureInput(1)); got.Agent.Findings[0].RuleID != "" {
+		t.Fatalf("a review without packs cannot cite a rule: %+v", got.Agent.Findings)
+	}
+}
