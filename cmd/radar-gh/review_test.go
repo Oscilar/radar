@@ -285,3 +285,16 @@ func TestCheckoutFileResolvesFromThePolicyCheckout(t *testing.T) {
 		t.Fatal("a policy outside any checkout must be an error, not the working directory's file")
 	}
 }
+func TestWriteAuditFileIsPrivate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.json")
+	if err := writeAuditFile(path, radar.AuthorTrustAudit{Tier: 2}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("audit mode = %v, want 0600", info.Mode().Perm())
+	}
+}
