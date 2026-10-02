@@ -55,6 +55,9 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "review" {
 		os.Exit(runReview(os.Args[2:]))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "trust-replay" {
+		os.Exit(runTrustReplay(os.Args[2:]))
+	}
 	os.Exit(runReplay(os.Args[1:]))
 }
 

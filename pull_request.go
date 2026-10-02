@@ -137,6 +137,9 @@ type PullRequestPolicy struct {
 	// ReviewChunkChars caps the patch text sent in one review request; larger
 	// diffs are reviewed in several. Zero means defaultReviewChunkChars.
 	ReviewChunkChars int `json:"review_chunk_chars,omitempty"`
+	// AuthorTrust bounds the shadow-only adjustment a private per-author tier
+	// may make. Nil disables tiers.
+	AuthorTrust *PullRequestAuthorTrust `json:"author_trust,omitempty"`
 	// ReviewerMinConfidence overrides min_review_confidence for a reviewer,
 	// keyed by its provenance (e.g. "bedrock/us.anthropic.claude-sonnet-5").
 	// Review-findings only, so a reviewer passing at its floor has still
@@ -369,11 +372,27 @@ func (p PullRequestPolicy) Validate() error {
 			return err
 		}
 	}
-	return nil
+	return p.validateAuthorTrust()
 }
 
 // Review evaluates current PR state. It never performs provider mutations.
 func (r *PullRequestReviewer) Review(in PullRequestInput) PullRequestReview {
+	out, _ := r.review(in)
+	return out
+}
+
+// reviewFacts are the policy-independent results a tiered evaluation reuses,
+// so the review agents run once.
+type reviewFacts struct {
+	agentReviewed bool
+	denied        bool
+	riskPassed    bool
+	diff          Diff
+	results       []ACRResult
+}
+
+func (r *PullRequestReviewer) review(in PullRequestInput) (PullRequestReview, reviewFacts) {
+	var facts reviewFacts
 	out := PullRequestReview{
 		SchemaVersion:  1,
 		RequestID:      in.ID,
@@ -392,12 +411,12 @@ func (r *PullRequestReviewer) Review(in PullRequestInput) PullRequestReview {
 	}
 
 	if ok, reason := reviewStateGate(r.policy, in); !add("pr.state", ok, reason) {
-		return out
+		return out, facts
 	}
 
 	diff, complete, reason := pullRequestDiff(in)
 	if !add("pr.complete-diff", complete, reason) {
-		return out
+		return out, facts
 	}
 
 	denied, denyReason := pullRequestDenied(r.policy, in)
@@ -424,7 +443,7 @@ func (r *PullRequestReviewer) Review(in PullRequestInput) PullRequestReview {
 	out.RawRiskScore = r.scorer.Score(diff)
 	if math.IsNaN(out.RawRiskScore) || math.IsInf(out.RawRiskScore, 0) {
 		add("pr.risk-threshold", false, "risk scorer returned a non-finite value")
-		return out
+		return out, facts
 	}
 	out.RiskPercentile = r.calibrator.Percentile(out.RawRiskScore)
 	riskPassed := true
@@ -449,22 +468,30 @@ func (r *PullRequestReviewer) Review(in PullRequestInput) PullRequestReview {
 	if len(reviewDiff.Changes) == 0 {
 		add("pr.review-agent", false, fmt.Sprintf("all %d changed files are generated; nothing for the review agents to assess", len(out.Withheld)))
 	} else {
-		agentPassed = r.runReviewers(&out, reviewDiff, add)
+		agentPassed, facts.results = r.runReviewers(&out, reviewDiff, add)
+		facts.agentReviewed = true
 	}
+	facts.diff = reviewDiff
 
+	facts.denied, facts.riskPassed = denied, riskPassed
 	out.Eligible = !denied && allowlisted && riskPassed
-	switch {
-	case out.Eligible && agentPassed && len(in.Stack) > 0:
+	if out.Eligible && agentPassed && len(in.Stack) > 0 {
 		add("pr.stack", true, fmt.Sprintf("stacked on #%d; the verdict covers this pull request's own changes only", in.Stack[0].Number))
-		out.Action = PullRequestWouldApprove
-	case out.Eligible && agentPassed && r.policy.Mode == PullRequestModeApprove:
-		out.Action = PullRequestApprove
-	case out.Eligible && agentPassed:
-		out.Action = PullRequestWouldApprove
-	case !denied && !out.Eligible && agentPassed:
-		out.Action = PullRequestPolicyCandidate
 	}
-	return out
+	out.Action = decideAction(r.policy.Mode, len(in.Stack) > 0, denied, out.Eligible, agentPassed)
+	return out, facts
+}
+
+func decideAction(mode PullRequestMode, stacked, denied, eligible, agentPassed bool) PullRequestAction {
+	switch {
+	case eligible && agentPassed && (stacked || mode != PullRequestModeApprove):
+		return PullRequestWouldApprove
+	case eligible && agentPassed:
+		return PullRequestApprove
+	case !denied && !eligible && agentPassed:
+		return PullRequestPolicyCandidate
+	}
+	return PullRequestRouteToHuman
 }
 
 func (r *PullRequestReviewer) lockfileSummaries(in PullRequestInput) []LockfileSummary {
@@ -531,7 +558,7 @@ func (r *PullRequestReviewer) reviewableDiff(diff Diff, in PullRequestInput, loc
 
 // runReviewers runs every agent concurrently and records each verdict. It
 // passes only when every agent passes.
-func (r *PullRequestReviewer) runReviewers(out *PullRequestReview, diff Diff, add func(string, bool, string) bool) bool {
+func (r *PullRequestReviewer) runReviewers(out *PullRequestReview, diff Diff, add func(string, bool, string) bool) (bool, []ACRResult) {
 	results := make([]ACRResult, len(r.agents))
 	var wg sync.WaitGroup
 	for i, agent := range r.agents {
@@ -557,14 +584,14 @@ func (r *PullRequestReviewer) runReviewers(out *PullRequestReview, diff Diff, ad
 		out.Agent = results[0]
 		reason := out.Reviews[0].Reason
 		out.Reviews = nil
-		return add("pr.review-agent", passed == 1, reason)
+		return add("pr.review-agent", passed == 1, reason), results
 	}
 	out.Agent = mergeVerdicts(results, func(i int) string { return describeReviewAgent(r.agents[i]) })
 	for _, review := range out.Reviews {
 		add("pr.review-agent", review.Passed, review.Reviewer+": "+review.Reason)
 	}
 	return add("pr.review-consensus", passed == len(results),
-		fmt.Sprintf("%d of %d reviewers passed; every reviewer must", passed, len(results)))
+		fmt.Sprintf("%d of %d reviewers passed; every reviewer must", passed, len(results))), results
 }
 
 // defectSignals are the risk signals that describe a likely problem rather
@@ -578,17 +605,24 @@ var defectSignals = map[ChangeSignal]bool{
 }
 
 func (r *PullRequestReviewer) reviewerPasses(reviewer string, res ACRResult, diff Diff) (bool, string) {
-	blocking := r.policy.blockingSeverities()
-	hasBlocking := hasBlockingFinding(res.Findings, blocking)
-	covered := reviewCoversDiff(res, diff) && !res.Truncated
 	minConfidence := r.policy.MinReviewConfidence
 	if r.policy.basis() == ApprovalBasisReviewFindings {
 		minConfidence = r.policy.minConfidenceFor(reviewer)
 	}
+	return reviewerVerdict(r.policy, minConfidence, false, res, diff)
+}
+
+// reviewerVerdict applies the policy's bar for one reviewer. waiveClaim drops
+// the accept-claim requirement under allow-rules only; a decline always blocks
+// under review-findings.
+func reviewerVerdict(p PullRequestPolicy, minConfidence int, waiveClaim bool, res ACRResult, diff Diff) (bool, string) {
+	blocking := p.blockingSeverities()
+	hasBlocking := hasBlockingFinding(res.Findings, blocking)
+	covered := reviewCoversDiff(res, diff) && !res.Truncated
 	confident := res.Confidence >= minConfidence
 	var passed bool
 	var detail string
-	switch r.policy.basis() {
+	switch p.basis() {
 	case ApprovalBasisReviewFindings:
 		var defects []string
 		for _, s := range res.RiskSignals {
@@ -606,8 +640,8 @@ func (r *PullRequestReviewer) reviewerPasses(reviewer string, res ACRResult, dif
 		detail = fmt.Sprintf("confidence=%d/%d defect-signals=%v declined=%t", res.Confidence, minConfidence, defects, declined)
 	default:
 		claimed := res.Accept || res.ModelAccept
-		passed = claimed && confident && len(res.RiskSignals) == 0 && len(res.SafeSignals) > 0 && covered && !hasBlocking
-		detail = fmt.Sprintf("accept=%t confidence=%d/%d risk-signals=%d", claimed, res.Confidence, r.policy.MinReviewConfidence, len(res.RiskSignals))
+		passed = (claimed || waiveClaim) && confident && len(res.RiskSignals) == 0 && len(res.SafeSignals) > 0 && covered && !hasBlocking
+		detail = fmt.Sprintf("accept=%t confidence=%d/%d risk-signals=%d", claimed, res.Confidence, minConfidence, len(res.RiskSignals))
 	}
 	return passed, fmt.Sprintf("%s reviewed-files=%d/%d blocking-findings(%s)=%t: %s",
 		detail, len(res.ReviewedFiles), len(diff.Changes), strings.Join(blocking, ","), hasBlocking, res.Summary)

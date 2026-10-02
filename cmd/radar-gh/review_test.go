@@ -285,3 +285,41 @@ func TestCheckoutFileResolvesFromThePolicyCheckout(t *testing.T) {
 		t.Fatal("a policy outside any checkout must be an error, not the working directory's file")
 	}
 }
+func TestWriteAuditFileIsPrivate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.json")
+	if err := writeAuditFile(path, radar.AuthorTrustAudit{Tier: 2}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("audit mode = %v, want 0600", info.Mode().Perm())
+	}
+}
+
+func TestWriteAuditFileReplacesReadableFileAndRefusesSymlink(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.json")
+	if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAuditFile(path, radar.AuthorTrustAudit{Tier: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("existing world-readable audit not made private: %v %v", info.Mode(), err)
+	}
+	target := filepath.Join(dir, "elsewhere.json")
+	link := filepath.Join(dir, "link.json")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skip(err)
+	}
+	if err := writeAuditFile(link, radar.AuthorTrustAudit{Tier: 2}); err == nil {
+		t.Fatal("wrote through a symlink")
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatal("symlink target was created")
+	}
+}

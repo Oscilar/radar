@@ -4,6 +4,16 @@ Policy decisions behind Radar's review-findings basis, newest first. Each
 names who decided and the evidence; the replay data lives with the Linear
 issue.
 
+
+## Author trust tiers keep the decline rule (INF-1151, 2026-10-01)
+
+Private per-author tiers are evaluated in shadow only and lower a confidence
+floor by at most one point. Under review-findings a tiered evaluation still
+treats any decline as blocking, as TJ decided for INF-1220. The review prompt
+tells reviewers not to accept below 8/10, so a tier changes a review-findings
+verdict only when a reviewer accepts at 7. The shadow audit measures how often
+that is, before anyone weighs relaxing the decline rule for tiered authors.
+
 ## A reviewer's explicit decline blocks approval (INF-1220, 2026-10-01)
 
 Under `approval_basis: review-findings`, a reviewer passes only if it accepts
